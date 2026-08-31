@@ -3,21 +3,22 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Timetable clashes</title>
+<title>Timetable staffing</title>
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 
 <header>
   <div class="masthead">
-    <h1>Timetable clashes</h1>
+    <h1>Timetable staffing</h1>
     <span class="term" id="term"></span>
     <button class="verdict" id="verdict">Loading</button>
   </div>
   <nav id="tabs">
-    <button data-view="staff" aria-current="true">Staff</button>
+    <button data-view="dashboard" aria-current="true">Dashboard</button>
+    <button data-view="planner">Planner</button>
+    <button data-view="staff">Staff</button>
     <button data-view="load">Load</button>
-    <button data-view="timetable">Timetable</button>
     <button data-view="exceptions">Exceptions</button>
     <button data-view="setup">Setup</button>
   </nav>

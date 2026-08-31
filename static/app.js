@@ -1,7 +1,9 @@
 "use strict";
 
-// Must match VERSION in app.py. See the note there.
-const APP_VERSION = "2026-08-31.3";
+// Kept in step with VERSION in app.py. The browser reads this file fresh on
+// every load but the routes live in the running server, so a new front end can
+// meet an old one. This is what lets the page say so.
+const APP_VERSION = "2026-09-01.1";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
               "Saturday", "Sunday"];
@@ -13,81 +15,70 @@ const DAY_VAR = {
 
 const dayColour = (day) => `var(${DAY_VAR[day] || "--quiet"})`;
 
-function dayDot(day) {
-  return el("span", {
-    class: "dot",
-    style: `background:${dayColour(day)}`,
-    title: day || "",
-  });
-}
-
-function dayKey() {
-  return el("div", { class: "daykey" },
-    DAYS.slice(0, 5).map((d) =>
-      el("span", {}, dayDot(d), d)));
-}
+// One colour per person, assigned by their place in the staff list, so the
+// planner reads like a chart rather than a table of names.
+const PEOPLE_COLOURS = 8;
 
 let state = null;
-let view = "staff";
-let chosenStaff = null;
+let staffColour = {};
+
+// ------------------------------------------------------------ small helpers
 
 const $ = (sel) => document.querySelector(sel);
 const main = () => $("#main");
 
-// ------------------------------------------------------------ small helpers
-
 function el(tag, attrs = {}, ...kids) {
   const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (v === null || v === undefined || v === false) continue;
-    if (k === "class") node.className = v;
-    else if (k === "html") node.innerHTML = v;
-    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
-    else node.setAttribute(k, v === true ? "" : v);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === "class") node.className = value;
+    else if (key === "text") node.textContent = value;
+    else if (key === "html") node.innerHTML = value;
+    else if (key === "style") node.setAttribute("style", value);
+    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else node.setAttribute(key, value === true ? "" : value);
   }
   for (const kid of kids.flat()) {
     if (kid === null || kid === undefined || kid === false) continue;
-    node.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+    node.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
   }
   return node;
 }
 
 function toast(message, isError = false) {
-  document.querySelectorAll(".toast").forEach((t) => t.remove());
-  const node = el("div", { class: "toast" + (isError ? " error" : "") }, message);
-  document.body.append(node);
-  setTimeout(() => node.remove(), isError ? 6000 : 2500);
+  const note = el("div", { class: `toast ${isError ? "bad" : ""}`, text: message });
+  document.body.append(note);
+  setTimeout(() => note.remove(), isError ? 6000 : 3000);
 }
 
 async function api(method, path, body) {
-  const res = await fetch(path, {
-    method,
-    headers: body ? { "Content-Type": "application/json" } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    if (res.status === 404 && path.startsWith("/api/")) {
-      throw new Error(
-        "The running server does not have this feature. Stop it with Ctrl+C "
-        + "and run python app.py again.");
-    }
-    let detail = `${method} ${path} failed`;
-    try {
-      const data = await res.json();
-      if (data.detail) {
-        detail = typeof data.detail === "string"
-          ? data.detail
-          : "Some fields are missing or the wrong shape.";
-      }
-    } catch (_) { /* keep the fallback */ }
-    throw new Error(detail);
+  const options = { method };
+  if (body instanceof FormData) {
+    options.body = body;
+  } else if (body !== undefined) {
+    options.headers = { "Content-Type": "application/json" };
+    options.body = JSON.stringify(body);
   }
-  return res.status === 204 ? null : res.json();
+  const reply = await fetch(path, options);
+  let payload = null;
+  try { payload = await reply.json(); } catch { /* no body */ }
+
+  if (!reply.ok) {
+    const detail = payload && payload.detail;
+    const error = new Error(
+      (detail && (detail.message || detail)) || `${reply.status} on ${path}`
+    );
+    error.status = reply.status;
+    error.detail = detail;
+    throw error;
+  }
+  return payload;
 }
 
 const staffName = (id) => {
+  if (!id) return "Nobody";
   const person = state.staff.find((s) => s.id === id);
-  return person ? person.name : (id || "Unassigned");
+  return person ? person.name : id;
 };
 
 const weekNumbers = () => state.weeks.map((w) => w.number);
@@ -98,829 +89,1017 @@ const shortDate = (iso) =>
 
 const hours = (mins) => (mins / 60).toFixed(1).replace(/\.0$/, "");
 
-function ribbon(activeWeeks, { light = false } = {}) {
-  const active = new Set(activeWeeks);
-  return el("div", { class: "ribbon" },
-    weekNumbers().map((n) =>
-      el("i", {
-        class: active.has(n) ? (light ? "lite" : "on") : "",
-        title: `Week ${n}`,
-      }, active.has(n) ? "" : "")));
+/** "1-6, 8, 10-12" — how people write a set of weeks. */
+function weekRanges(weeks) {
+  if (!weeks || !weeks.length) return "none";
+  const sorted = [...weeks].sort((a, b) => a - b);
+  const parts = [];
+  let first = sorted[0];
+  let last = sorted[0];
+  for (const week of sorted.slice(1)) {
+    if (week === last + 1) { last = week; continue; }
+    parts.push(first === last ? `${first}` : `${first}-${last}`);
+    first = last = week;
+  }
+  parts.push(first === last ? `${first}` : `${first}-${last}`);
+  return parts.join(", ");
 }
 
-function ribbonScale() {
-  return el("div", { class: "ribbon-scale" },
-    weekNumbers().map((n) => el("span", {}, n)));
+function assignColours() {
+  staffColour = {};
+  state.staff.forEach((person, index) => {
+    staffColour[person.id] = `var(--p${index % PEOPLE_COLOURS})`;
+  });
+}
+
+const personColour = (id) => staffColour[id] || "var(--quiet)";
+
+function dayDot(day) {
+  return el("span", {
+    class: "dot",
+    style: `background:${dayColour(day)}`,
+    title: day || "",
+  });
+}
+
+function dayKey() {
+  return el("div", { class: "daykey" },
+    DAYS.slice(0, 5).map((day) =>
+      el("span", {}, dayDot(day), el("span", { text: day }))));
 }
 
 // ------------------------------------------------------------ loading
 
 async function refresh() {
   state = await api("GET", "/api/state");
-  if (!chosenStaff || !state.staff.some((s) => s.id === chosenStaff)) {
-    chosenStaff = state.staff.length ? state.staff[0].id : null;
-  }
+  assignColours();
   renderChrome();
   render();
 }
 
 function staleServerBanner() {
-  if (state.version === APP_VERSION) return null;
-  return el("section", { class: "panel stale" },
-    el("h3", {}, "The server needs restarting"),
-    el("p", { class: "hint" },
-      "This page has been updated but the running server has not. Stop it in "
-      + "the terminal with Ctrl+C, run python app.py again, then reload. "
-      + `Page ${APP_VERSION}, server ${state.version || "older than 2026-08-31.3"}.`));
+  if (!state || state.version === APP_VERSION) return null;
+  return el("div", { class: "issues stale" },
+    el("strong", { text: "The server is running an older version of this tool. " }),
+    "Stop it and run python app.py again. ",
+    el("span", { class: "muted", text: `Page ${APP_VERSION}, server ${state.version}.` }));
 }
 
 function renderChrome() {
   const weeks = state.weeks;
   $("#term").textContent = weeks.length
-    ? `${weeks.length} teaching weeks, from ${shortDate(weeks[0].starts)}`
+    ? `${weeks.length} teaching weeks, ${shortDate(weeks[0].starts)} to ${shortDate(weeks[weeks.length - 1].ends)}`
     : "No teaching calendar yet";
 
+  const cover = state.coverage;
+  const gaps = cover.total - cover.covered;
   const verdict = $("#verdict");
-  const count = state.problems.length;
-  verdict.className = "verdict " + (count ? "bad" : "good");
-  verdict.textContent = count === 0
-    ? "No clashes"
-    : count === 1 ? "1 clash" : `${count} clashes`;
-  verdict.onclick = count
-    ? () => { view = "timetable"; focusedClash = null; render(); }
-    : null;
+
+  if (state.problems.length) {
+    verdict.textContent = `${state.problems.length} clash${state.problems.length > 1 ? "es" : ""}`;
+    verdict.className = "verdict bad";
+  } else if (gaps) {
+    verdict.textContent = `${cover.percent}% staffed`;
+    verdict.className = "verdict warn";
+  } else {
+    verdict.textContent = "Fully staffed";
+    verdict.className = "verdict good";
+  }
+  verdict.onclick = () => go(state.problems.length ? "planner" : "dashboard");
 }
 
-// ------------------------------------------------------------ staff view
+// ------------------------------------------------------------ dashboard
 
-function staffView() {
+function dashboardView() {
+  const cover = state.coverage;
+  const gaps = cover.total - cover.covered;
+
+  const tiles = el("div", { class: "tiles" },
+    tile(`${cover.percent}%`, "of class weeks staffed",
+      cover.percent === 100 ? "good" : "warn"),
+    tile(gaps, gaps === 1 ? "class week needs somebody" : "class weeks need somebody",
+      gaps ? "warn" : "good"),
+    tile(state.staff.length, state.staff.length === 1 ? "person" : "people"),
+    tile(state.problems.length,
+      state.problems.length === 1 ? "clash to sort out" : "clashes to sort out",
+      state.problems.length ? "bad" : "good"),
+  );
+
+  return el("div", {}, staleServerBanner(), tiles, issuesPanel(),
+    el("div", { class: "columns" }, needsSomebodyPanel(), utilisationPanel()));
+}
+
+function tile(value, label, tone = "") {
+  return el("div", { class: `tile ${tone}` },
+    el("div", { class: "figure", text: String(value) }),
+    el("div", { class: "label", text: label }));
+}
+
+function needsSomebodyPanel() {
+  const rows = state.coverage.rows;
+  const panel = el("section", { class: "panel" },
+    el("h2", { text: "Needs somebody" }));
+
+  if (!rows.length) {
+    panel.append(el("p", { class: "hint" },
+      state.timetable.length
+        ? "Every class that runs has somebody on it."
+        : "No timetable yet. Import one from Setup."));
+    return panel;
+  }
+
+  panel.append(el("p", { class: "hint" },
+    "Classes with nobody on them. That can be deliberate, if another team ",
+    "teaches them. Click one to staff it."));
+
+  const table = el("table", {},
+    el("thead", {}, el("tr", {},
+      el("th", { text: "Class" }), el("th", { text: "Day" }),
+      el("th", { text: "Weeks" }), el("th", {}))));
+
+  const body = el("tbody");
+  for (const row of rows) {
+    body.append(el("tr", {},
+      el("td", {}, el("strong", { text: `${row.course_code} ${row.section}` }),
+        row.course_title ? el("div", { class: "muted", text: row.course_title }) : null),
+      el("td", {}, dayDot(row.day), row.day || "—"),
+      el("td", { text: weekRanges(row.weeks) },),
+      el("td", { class: "right" },
+        row.timetable_row_id
+          ? el("button", {
+              class: "action",
+              onclick: () => { go("planner"); openAssign(row.timetable_row_id); },
+              text: "Staff it",
+            })
+          : el("span", { class: "muted", text: "added class" }))));
+  }
+  table.append(body);
+  panel.append(table);
+  return panel;
+}
+
+function utilisationPanel() {
+  const panel = el("section", { class: "panel" }, el("h2", { text: "Who is carrying what" }));
+
   if (!state.staff.length) {
-    return [emptyPanel("No staff yet.", "Add people in Setup, then build the timetable.")];
+    panel.append(el("p", { class: "hint", text: "No staff yet. Add them on Setup." }));
+    return panel;
   }
 
-  const classes = state.classes.filter(
-    (c) => c.staff_id === chosenStaff && c.status !== "Cancelled");
-  const cancelled = state.classes.filter(
-    (c) => c.status === "Cancelled" && cancelledBelongsTo(c, chosenStaff));
+  const teachingWeeks = weekNumbers().length || 1;
+  panel.append(el("p", { class: "hint" },
+    "Average contact hours a week across the semester, against a target where ",
+    "one is set."));
 
-  const totalMins = classes.reduce((sum, c) => sum + c.minutes, 0);
-  const clashWeeks = new Set(classes.filter((c) => c.clashing).map((c) => c.week));
+  const list = el("div", { class: "bars" });
+  const peak = Math.max(1, ...state.staff.map((s) => averageMinutes(s.id)));
 
-  const picker = el("div", { class: "picker" },
-    el("div", {},
-      el("label", { for: "who" }, "Staff member"),
-      el("select", {
-        id: "who",
-        onchange: (e) => { chosenStaff = e.target.value; render(); },
-      }, state.staff.map((s) =>
-        el("option", { value: s.id, selected: s.id === chosenStaff },
-          `${s.name} (${s.id})`)))),
-    el("div", {},
-      el("label", {}, "Teaching hours"),
-      el("div", { class: "stat" }, hours(totalMins))),
-    el("div", {},
-      el("label", {}, "Weeks with a clash"),
-      el("div", { class: "stat" + (clashWeeks.size ? " bad" : "") },
-        clashWeeks.size)),
-    el("div", { style: "flex:1 1 12rem; min-width:10rem" },
-      el("label", {}, "Clash weeks"),
-      ribbonScale(),
-      ribbon([...clashWeeks])));
+  for (const person of state.staff) {
+    const average = averageMinutes(person.id);
+    const target = person.target_minutes;
+    const spikes = state.over_target.filter((o) => o.staff_id === person.id);
+    const over = target && average > target;
+    const width = Math.round((average / peak) * 100);
 
-  const rows = state.weeks.map((w) => {
-    const mine = classes.filter((c) => c.week === w.number);
-    const gone = cancelled.filter((c) => c.week === w.number);
-    const cells = mine.length || gone.length
-      ? el("div", { class: "cells" },
-          mine.map(classCard),
-          gone.map((c) => classCard(c)))
-      : el("div", { class: "cells" }, "No teaching this week");
-
-    return el("div", { class: "weekrow" + (mine.length ? "" : " free") },
-      el("div", { class: "wk" }, `Wk ${w.number}`),
-      el("div", { class: "dt" }, shortDate(w.starts)),
-      cells);
-  });
-
-  return [
-    el("section", { class: "panel" }, picker),
-    el("section", { class: "panel" },
-      el("h2", {}, `${staffName(chosenStaff)} across the semester`),
-      el("p", { class: "hint" },
-        "Red means this person is timetabled twice at once that week. "
-        + "Teaching outside these courses is not shown, so a quiet week is not "
-        + "necessarily a free one."),
-      el("div", { class: "daykey", style: "margin-top:0.5rem" },
-        DAYS.slice(0, 5).map((d) => el("span", {}, dayDot(d), d))),
-      el("div", { style: "margin-top:0.6rem" }, rows)),
-  ];
-}
-
-function cancelledBelongsTo(cancelledClass, staffId) {
-  // A cancelled class has no staff, so trace it back through the timetable.
-  return state.timetable.some(
-    (r) => r.course_code === cancelledClass.course_code
-      && r.section === cancelledClass.section
-      && r.staff_id === staffId
-      && r.weeks.includes(cancelledClass.week));
-}
-
-function classCard(c) {
-  const cls = ["klass", c.status.toLowerCase(), c.clashing ? "clashing" : ""]
-    .filter(Boolean).join(" ");
-  return el("div", {
-    class: cls,
-    style: c.day ? `border-left-color:${dayColour(c.day)}` : "",
-  },
-    el("div", { class: "code" }, c.label),
-    el("div", { class: "when" },
-      c.status === "Cancelled"
-        ? "Not running"
-        : `${c.day.slice(0, 3)} ${c.start} to ${c.end}`),
-    c.status !== "Scheduled" && el("div", { class: "note" }, c.status));
-}
-
-// ------------------------------------------------------------ clashes
-
-function weekRanges(weeks) {
-  // "1 to 4, 6 to 12" reads better than a list, and unlike "every week" it
-  // stays true when one week is clear.
-  const runs = [];
-  for (const n of weeks) {
-    const last = runs[runs.length - 1];
-    if (last && n === last[1] + 1) last[1] = n;
-    else runs.push([n, n]);
+    list.append(el("div", { class: "bar-row" },
+      el("div", { class: "bar-name" },
+        el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
+        person.name),
+      el("div", { class: "bar-track" },
+        el("div", {
+          class: `bar-fill ${over ? "over" : ""}`,
+          style: `width:${width}%; background:${over ? "var(--clash)" : personColour(person.id)}`,
+        }),
+        target
+          ? el("div", {
+              class: "bar-target",
+              style: `left:${Math.min(100, Math.round((target / peak) * 100))}%`,
+              title: `Target ${hours(target)} hours`,
+            })
+          : null),
+      el("div", { class: "bar-value" },
+        `${hours(average)} h`,
+        target ? el("span", { class: "muted", text: ` of ${hours(target)}` }) : null),
+      el("div", { class: "bar-note" },
+        spikes.length
+          ? el("span", {
+              class: "flag warn",
+              text: `over in ${weekRanges(spikes.map((o) => o.week))}`,
+            })
+          : null)));
   }
-  const text = runs
-    .map(([a, b]) => (a === b ? `${a}` : `${a} to ${b}`))
-    .join(", ");
-  return (weeks.length === 1 ? "Week " : "Weeks ") + text;
+
+  panel.append(list);
+  return panel;
+
+  function averageMinutes(id) {
+    const byWeek = state.load[id] || {};
+    const total = Object.values(byWeek).reduce((sum, m) => sum + m, 0);
+    return total / teachingWeeks;
+  }
 }
 
-// ------------------------------------------------------------ loading
+// ------------------------------------------------------------ planner
 
-async function refresh() {
-  state = await api("GET", "/api/state");
-  if (!chosenStaff || !state.staff.some((s) => s.id === chosenStaff)) {
-    chosenStaff = state.staff.length ? state.staff[0].id : null;
+let openRow = null;      // the timetable row whose assign panel is showing
+
+function plannerView() {
+  const wrap = el("div", {}, staleServerBanner(), issuesPanel(), clashPanel());
+
+  if (!state.timetable.length) {
+    wrap.append(emptyPanel("No timetable yet",
+      "Import the published timetable from Setup, or add classes by hand."));
+    return wrap;
   }
-  renderChrome();
+
+  const panel = el("section", { class: "panel" },
+    el("div", { class: "toolbar" },
+      el("h2", { text: "Timetable" }),
+      el("span", { class: "spacer" }),
+      dayKey(),
+      el("button", {
+        class: "action", text: "Add a class",
+        onclick: () => editTimetable(null),
+      })));
+
+  panel.append(el("p", { class: "hint" },
+    "The timetable is set outside this tool. What you decide is who covers it, ",
+    "week by week. Nobody can be put in two places at once."));
+
+  const table = el("table", { class: "planner" },
+    el("thead", {}, el("tr", {},
+      el("th", { text: "Class" }),
+      el("th", { text: "When" }),
+      el("th", { text: "Staffing" }),
+      el("th", {}))));
+
+  const body = el("tbody");
+  for (const row of state.timetable) {
+    body.append(plannerRow(row));
+    if (openRow === row.id) body.append(assignRow(row));
+  }
+  table.append(body);
+  panel.append(table);
+  wrap.append(panel);
+  return wrap;
+}
+
+function spansFor(rowId) {
+  return state.assignments.filter((a) => a.timetable_id === rowId);
+}
+
+function plannerRow(row) {
+  const spans = spansFor(row.id);
+  const staffed = new Set(spans.flatMap((s) => s.weeks));
+  const gaps = row.weeks.filter((w) => !staffed.has(w) && !isCancelled(row, w));
+  const clashing = state.classes.some(
+    (c) => c.timetable_row_id === row.id && c.clashing);
+
+  return el("tr", { class: clashing ? "clash" : "" },
+    el("td", {},
+      el("strong", { text: `${row.course_code} ${row.section}` }),
+      row.course_title ? el("div", { class: "muted", text: row.course_title }) : null),
+    el("td", {},
+      dayDot(row.day),
+      `${row.day} ${row.start}–${row.end}`,
+      el("div", { class: "muted", text: `weeks ${weekRanges(row.weeks)}` })),
+    el("td", {}, staffingCell(row, spans, gaps)),
+    el("td", { class: "right" },
+      el("button", {
+        class: openRow === row.id ? "action primary" : "action",
+        text: openRow === row.id ? "Close" : "Assign",
+        onclick: () => { openRow = openRow === row.id ? null : row.id; render(); },
+      }),
+      el("button", {
+        class: "link", text: "Edit", onclick: () => editTimetable(row),
+      })));
+}
+
+function isCancelled(row, week) {
+  return state.classes.some(
+    (c) => c.timetable_row_id === row.id && c.week === week && !c.runs);
+}
+
+/** Who covers this class, as named spans over a ribbon of the weeks it runs. */
+function staffingCell(row, spans, gaps) {
+  const cell = el("div", { class: "staffing" });
+
+  if (!spans.length) {
+    cell.append(el("span", { class: "flag warn", text: "nobody yet" }));
+  } else {
+    const chips = el("div", { class: "chips" });
+    for (const span of spans) {
+      chips.append(el("span", { class: "chip" },
+        el("span", { class: "swatch", style: `background:${personColour(span.staff_id)}` }),
+        staffName(span.staff_id),
+        el("span", { class: "muted", text: ` ${weekRanges(span.weeks)}` })));
+    }
+    cell.append(chips);
+    if (gaps.length) {
+      cell.append(el("span", { class: "flag warn", text: `gap in ${weekRanges(gaps)}` }));
+    }
+  }
+
+  cell.append(staffingRibbon(row, spans));
+  return cell;
+}
+
+function staffingRibbon(row, spans) {
+  const owner = {};
+  for (const span of spans) for (const week of span.weeks) owner[week] = span.staff_id;
+
+  const ribbon = el("div", { class: "ribbon" });
+  for (const week of weekNumbers()) {
+    const runs = row.weeks.includes(week);
+    const cancelled = runs && isCancelled(row, week);
+    const who = owner[week];
+    const cell = el("span", {
+      class: `wk ${!runs ? "off" : cancelled ? "cancelled" : who ? "" : "gap"}`,
+      style: runs && !cancelled && who ? `background:${personColour(who)}` : null,
+      title: !runs ? `Week ${week}: does not run`
+        : cancelled ? `Week ${week}: cancelled`
+        : who ? `Week ${week}: ${staffName(who)}`
+        : `Week ${week}: nobody`,
+    });
+    ribbon.append(cell);
+  }
+  return ribbon;
+}
+
+// ------------------------------------------------------------ assigning
+
+let assignScope = null;    // weeks selected in the open panel
+let candidates = null;     // availability for that scope
+
+function openAssign(rowId) {
+  openRow = rowId;
+  assignScope = null;
+  candidates = null;
   render();
 }
 
-function staleServerBanner() {
-  if (state.version === APP_VERSION) return null;
-  return el("section", { class: "panel stale" },
-    el("h3", {}, "The server needs restarting"),
-    el("p", { class: "hint" },
-      "This page has been updated but the running server has not. Stop it in "
-      + "the terminal with Ctrl+C, run python app.py again, then reload. "
-      + `Page ${APP_VERSION}, server ${state.version || "older than 2026-08-31.3"}.`));
+function assignRow(row) {
+  const cell = el("td", { colspan: 4 });
+  cell.append(assignPanel(row));
+  return el("tr", { class: "assign-row" }, cell);
 }
 
-function renderChrome() {
-  const weeks = state.weeks;
-  $("#term").textContent = weeks.length
-    ? `${weeks.length} teaching weeks, from ${shortDate(weeks[0].starts)}`
-    : "No teaching calendar yet";
+function assignPanel(row) {
+  if (assignScope === null) assignScope = [...row.weeks];
 
-  const verdict = $("#verdict");
-  const count = state.problems.length;
-  verdict.className = "verdict " + (count ? "bad" : "good");
-  verdict.textContent = count === 0
-    ? "No clashes"
-    : count === 1 ? "1 clash" : `${count} clashes`;
-  verdict.onclick = count
-    ? () => { view = "timetable"; focusedClash = null; render(); }
-    : null;
+  const panel = el("div", { class: "assign" });
+
+  panel.append(el("div", { class: "assign-head" },
+    el("h3", { text: `Who takes ${row.course_code} ${row.section}?` }),
+    el("span", { class: "muted", text: `${row.day} ${row.start}–${row.end}` })));
+
+  // 1. scope
+  const scope = el("div", { class: "scope" },
+    el("span", { class: "label", text: "Weeks" }),
+    el("button", {
+      class: sameWeeks(assignScope, row.weeks) ? "pill on" : "pill",
+      text: `every week it runs (${weekRanges(row.weeks)})`,
+      onclick: () => { assignScope = [...row.weeks]; candidates = null; render(); },
+    }));
+
+  const halves = splitPoints(row.weeks);
+  for (const half of halves) {
+    scope.append(el("button", {
+      class: sameWeeks(assignScope, half.weeks) ? "pill on" : "pill",
+      text: half.label,
+      onclick: () => { assignScope = half.weeks; candidates = null; render(); },
+    }));
+  }
+  panel.append(scope);
+
+  // week ticks, so any set at all can be chosen
+  const ticks = el("div", { class: "weekticks" });
+  for (const week of row.weeks) {
+    const on = assignScope.includes(week);
+    ticks.append(el("button", {
+      class: on ? "tick on" : "tick",
+      text: String(week),
+      onclick: () => {
+        assignScope = on
+          ? assignScope.filter((w) => w !== week)
+          : [...assignScope, week].sort((a, b) => a - b);
+        candidates = null;
+        render();
+      },
+    }));
+  }
+  panel.append(ticks);
+
+  if (!assignScope.length) {
+    panel.append(el("p", { class: "hint", text: "Pick at least one week." }));
+    return panel;
+  }
+
+  // 2. candidates
+  if (candidates === null) {
+    loadCandidates(row);
+    panel.append(el("p", { class: "hint", text: "Looking at who is free…" }));
+    return panel;
+  }
+
+  panel.append(el("p", { class: "hint" },
+    "People already teaching something else at this time are greyed out, so a ",
+    "clash cannot be made by accident."));
+
+  const free = candidates.filter((p) => p.free);
+  const busy = candidates.filter((p) => !p.free);
+  const list = el("div", { class: "candidates" });
+
+  for (const person of [...free, ...busy]) {
+    list.append(candidateCard(row, person));
+  }
+  panel.append(list);
+
+  const held = spansFor(row.id).filter((s) =>
+    s.weeks.some((w) => assignScope.includes(w)));
+  if (held.length) {
+    panel.append(el("div", { class: "toolbar" },
+      el("button", {
+        class: "link danger",
+        text: `Take nobody for ${weekRanges(assignScope)}`,
+        onclick: () => unassign(row),
+      })));
+  }
+
+  return panel;
+}
+
+function candidateCard(row, person) {
+  // Per week, because the target is per week. A semester total beside a weekly
+  // target invites the wrong comparison.
+  const perWeek = person.minutes / (weekNumbers().length || 1);
+  const target = person.target_minutes;
+
+  if (!person.free) {
+    return el("div", { class: "cand busy" },
+      el("div", { class: "cand-name" },
+        el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
+        person.name),
+      el("div", { class: "cand-why", text: `busy in ${weekRanges(person.busy_weeks)}` }));
+  }
+
+  return el("button", {
+    class: "cand",
+    onclick: () => assignTo(row, person),
+  },
+    el("div", { class: "cand-name" },
+      el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
+      person.name),
+    el("div", { class: "cand-why" },
+      `${hours(perWeek)} h a week`,
+      target
+        ? el("span", {
+            class: perWeek > target ? "over" : "muted",
+            text: ` of ${hours(target)}`,
+          })
+        : null));
+}
+
+function splitPoints(weeks) {
+  if (weeks.length < 4) return [];
+  const middle = Math.ceil(weeks.length / 2);
+  const first = weeks.slice(0, middle);
+  const second = weeks.slice(middle);
+  return [
+    { label: `weeks ${weekRanges(first)}`, weeks: first },
+    { label: `weeks ${weekRanges(second)}`, weeks: second },
+  ];
+}
+
+const sameWeeks = (a, b) =>
+  a.length === b.length && a.every((w, i) => w === b[i]);
+
+async function loadCandidates(row) {
+  try {
+    const reply = await api("POST", "/api/availability", {
+      day: row.day, start: row.start, end: row.end,
+      weeks: assignScope, timetable_id: row.id,
+    });
+    candidates = reply.staff;
+    render();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function assignTo(row, person, replace = false) {
+  try {
+    await api("POST", "/api/assign", {
+      timetable_id: row.id, staff_id: person.id,
+      weeks: assignScope, replace,
+    });
+    toast(`${person.name} takes ${row.course_code} ${row.section}, weeks ${weekRanges(assignScope)}.`);
+    openRow = null;
+    assignScope = null;
+    candidates = null;
+    await refresh();
+  } catch (error) {
+    if (error.status === 409 && error.detail && error.detail.error === "already_assigned") {
+      const ok = await confirmDialog(
+        "Hand this over?",
+        `${error.detail.message} Give those weeks to ${person.name} instead?`);
+      if (ok) await assignTo(row, person, true);
+      return;
+    }
+    // The picker greys out anyone who would clash, so this is a last defence.
+    toast(error.message, true);
+    candidates = null;
+    render();
+  }
+}
+
+async function unassign(row) {
+  try {
+    await api("POST", "/api/unassign", {
+      timetable_id: row.id, weeks: assignScope,
+    });
+    toast(`Nobody on ${row.course_code} ${row.section} for weeks ${weekRanges(assignScope)}.`);
+    candidates = null;
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+// ------------------------------------------------------------ clashes
+
+function clashPanel() {
+  if (!state.problems.length) return null;
+
+  const panel = el("section", { class: "panel clashlist" },
+    el("h2", { text: state.problems.length === 1 ? "A clash" : "Clashes" }),
+    el("p", { class: "hint" },
+      "Assignments are checked before they are made, so these came in with the ",
+      "data rather than from staffing. Reassign one side of each pair."));
+
+  for (const problem of state.problems) {
+    panel.append(el("div", { class: "clashrow" },
+      el("strong", { text: staffName(problem.staff_id) }),
+      " is in two places in ",
+      el("strong", { text: `week${problem.weeks.length > 1 ? "s" : ""} ${weekRanges(problem.weeks)}` }),
+      ": ",
+      el("span", { class: "klass", text: problem.a.label }),
+      " and ",
+      el("span", { class: "klass", text: problem.b.label }),
+      problem.a.timetable_row_id
+        ? el("button", {
+            class: "link", text: "Fix",
+            onclick: () => openAssign(problem.a.timetable_row_id),
+          })
+        : null));
+  }
+  return panel;
 }
 
 // ------------------------------------------------------------ staff view
 
 function staffView() {
+  const wrap = el("div", {}, staleServerBanner());
+
   if (!state.staff.length) {
-    return [emptyPanel("No staff yet.", "Add people in Setup, then build the timetable.")];
+    wrap.append(emptyPanel("No staff yet", "Add people on the Setup page."));
+    return wrap;
   }
 
-  const classes = state.classes.filter(
-    (c) => c.staff_id === chosenStaff && c.status !== "Cancelled");
-  const cancelled = state.classes.filter(
-    (c) => c.status === "Cancelled" && cancelledBelongsTo(c, chosenStaff));
+  wrap.append(el("div", { class: "toolbar" }, dayKey()));
 
-  const totalMins = classes.reduce((sum, c) => sum + c.minutes, 0);
-  const clashWeeks = new Set(classes.filter((c) => c.clashing).map((c) => c.week));
+  for (const person of state.staff) {
+    const mine = state.classes.filter((c) => c.staff_id === person.id);
+    const byWeek = new Map();
+    for (const c of mine) {
+      if (!byWeek.has(c.week)) byWeek.set(c.week, []);
+      byWeek.get(c.week).push(c);
+    }
 
-  const picker = el("div", { class: "picker" },
-    el("div", {},
-      el("label", { for: "who" }, "Staff member"),
-      el("select", {
-        id: "who",
-        onchange: (e) => { chosenStaff = e.target.value; render(); },
-      }, state.staff.map((s) =>
-        el("option", { value: s.id, selected: s.id === chosenStaff },
-          `${s.name} (${s.id})`)))),
-    el("div", {},
-      el("label", {}, "Teaching hours"),
-      el("div", { class: "stat" }, hours(totalMins))),
-    el("div", {},
-      el("label", {}, "Weeks with a clash"),
-      el("div", { class: "stat" + (clashWeeks.size ? " bad" : "") },
-        clashWeeks.size)),
-    el("div", { style: "flex:1 1 12rem; min-width:10rem" },
-      el("label", {}, "Clash weeks"),
-      ribbonScale(),
-      ribbon([...clashWeeks])));
+    const panel = el("section", { class: "panel" },
+      el("div", { class: "toolbar" },
+        el("h2", {},
+          el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
+          person.name),
+        el("span", { class: "spacer" }),
+        el("span", { class: "muted", text: `${mine.filter((c) => c.runs).length} classes` })));
 
-  const rows = state.weeks.map((w) => {
-    const mine = classes.filter((c) => c.week === w.number);
-    const gone = cancelled.filter((c) => c.week === w.number);
-    const cells = mine.length || gone.length
-      ? el("div", { class: "cells" },
-          mine.map(classCard),
-          gone.map((c) => classCard(c)))
-      : el("div", { class: "cells" }, "No teaching this week");
+    const grid = el("div", { class: "weeks" });
+    for (const week of state.weeks) {
+      const classes = (byWeek.get(week.number) || [])
+        .sort((a, b) => DAYS.indexOf(a.day) - DAYS.indexOf(b.day) ||
+                        String(a.start).localeCompare(String(b.start)));
+      grid.append(el("div", { class: "week" },
+        el("div", { class: "week-head" },
+          el("strong", { text: `Week ${week.number}` }),
+          el("span", { class: "muted", text: shortDate(week.starts) }),
+          week.note ? el("div", { class: "muted note", text: week.note }) : null),
+        classes.length
+          ? classes.map(classCard)
+          : el("div", { class: "empty", text: "nothing timetabled" })));
+    }
+    panel.append(grid);
+    wrap.append(panel);
+  }
 
-    return el("div", { class: "weekrow" + (mine.length ? "" : " free") },
-      el("div", { class: "wk" }, `Wk ${w.number}`),
-      el("div", { class: "dt" }, shortDate(w.starts)),
-      cells);
-  });
-
-  return [
-    el("section", { class: "panel" }, picker),
-    el("section", { class: "panel" },
-      el("h2", {}, `${staffName(chosenStaff)} across the semester`),
-      el("p", { class: "hint" },
-        "Red means this person is timetabled twice at once that week. "
-        + "Teaching outside these courses is not shown, so a quiet week is not "
-        + "necessarily a free one."),
-      el("div", { class: "daykey", style: "margin-top:0.5rem" },
-        DAYS.slice(0, 5).map((d) => el("span", {}, dayDot(d), d))),
-      el("div", { style: "margin-top:0.6rem" }, rows)),
-  ];
-}
-
-function cancelledBelongsTo(cancelledClass, staffId) {
-  // A cancelled class has no staff, so trace it back through the timetable.
-  return state.timetable.some(
-    (r) => r.course_code === cancelledClass.course_code
-      && r.section === cancelledClass.section
-      && r.staff_id === staffId
-      && r.weeks.includes(cancelledClass.week));
+  wrap.append(el("p", { class: "hint" },
+    "Teaching outside this timetable is not tracked, so an empty week here does ",
+    "not mean that person is free."));
+  return wrap;
 }
 
 function classCard(c) {
-  const cls = ["klass", c.status.toLowerCase(), c.clashing ? "clashing" : ""]
-    .filter(Boolean).join(" ");
+  const status = !c.runs ? "cancelled" : c.status === "Changed" ? "changed"
+    : c.status === "Added" ? "added" : "";
   return el("div", {
-    class: cls,
-    style: c.day ? `border-left-color:${dayColour(c.day)}` : "",
+    class: `klass ${status} ${c.clashing ? "clash" : ""}`,
+    style: `border-left-color:${dayColour(c.day)}`,
   },
-    el("div", { class: "code" }, c.label),
-    el("div", { class: "when" },
-      c.status === "Cancelled"
-        ? "Not running"
-        : `${c.day.slice(0, 3)} ${c.start} to ${c.end}`),
-    c.status !== "Scheduled" && el("div", { class: "note" }, c.status));
-}
-
-// ------------------------------------------------------------ clashes
-
-function weekRanges(weeks) {
-  // "1 to 4, 6 to 12" reads better than a list, and unlike "every week" it
-  // stays true when one week is clear.
-  const runs = [];
-  for (const n of weeks) {
-    const last = runs[runs.length - 1];
-    if (last && n === last[1] + 1) last[1] = n;
-    else runs.push([n, n]);
-  }
-  const text = runs
-    .map(([a, b]) => (a === b ? `${a}` : `${a} to ${b}`))
-    .join(", ");
-  return (weeks.length === 1 ? "Week " : "Weeks ") + text;
-}
-
-function clashesView() {
-  if (!state.problems.length) {
-    return [emptyPanel("No clashes.",
-      "Nobody in the staff list is timetabled twice at once.")];
-  }
-
-  const rows = state.problems.flatMap((p, i) => {
-    const row = el("tr", { class: openResolve === i ? "resolving" : "" },
-      el("td", {}, el("div", {}, staffName(p.staff_id)),
-        el("div", { class: "muted" }, p.staff_id)),
-      el("td", {},
-        el("div", {}, p.a.label),
-        el("div", { class: "muted" },
-          dayDot(p.a.day), `${p.a.day.slice(0, 3)} ${p.a.start} to ${p.a.end}`)),
-      el("td", {},
-        el("div", {}, p.b.label),
-        el("div", { class: "muted" },
-          dayDot(p.b.day), `${p.b.day.slice(0, 3)} ${p.b.start} to ${p.b.end}`)),
-      el("td", { class: "mid tight" }, p.weeks.length),
-      el("td", { style: "min-width:10rem" }, ribbonScale(), ribbon(p.weeks)),
-      el("td", { class: "tight" }, weekRanges(p.weeks)),
-      el("td", { class: "tight" },
-        el("button", {
-          class: "link",
-          onclick: async () => {
-            if (openResolve === i) { openResolve = null; return render(); }
-            openResolve = i;
-            render();
-            const panel = await resolveRow(p, i);
-            const target = document.querySelector("tr.resolving");
-            if (target && openResolve === i) target.after(panel);
-          },
-        }, openResolve === i ? "Close" : "Resolve")));
-
-    return [row];
-  });
-
-  return [
-    el("section", { class: "panel" },
-      el("h2", {}, "What does not work"),
-      el("p", { class: "hint" },
-        "One row per clash, however many weeks it happens in. Resolve shows who "
-        + "is actually free at that time, so handing a class over cannot create "
-        + "a new clash by accident."),
-      el("div", { class: "scroll", style: "margin-top:0.7rem" },
-        el("table", {},
-          el("thead", {}, el("tr", {},
-            el("th", {}, "Staff"),
-            el("th", {}, "This class"),
-            el("th", {}, "Collides with"),
-            el("th", { class: "mid" }, "Weeks"),
-            el("th", {}, "When"),
-            el("th", {}, "Shape"),
-            el("th", {}))),
-          el("tbody", {}, rows)))),
-  ];
+    el("div", { class: "klass-label" }, c.label,
+      c.clashing ? el("span", { class: "badge bad", text: "clash" }) : null),
+    el("div", { class: "muted" },
+      c.runs ? `${c.day} ${c.start}–${c.end}` : "cancelled"),
+    c.status === "Added" ? el("span", { class: "badge", text: "added" }) : null,
+    c.status === "Changed" ? el("span", { class: "badge", text: "changed" }) : null);
 }
 
 // ------------------------------------------------------------ load
 
 function loadView() {
-  if (!state.staff.length) return [emptyPanel("No staff yet.", "Add people in Setup.")];
+  const wrap = el("div", {}, staleServerBanner());
+  const weeks = weekNumbers();
 
-  const clashCells = new Set(
-    state.classes.filter((c) => c.clashing).map((c) => `${c.staff_id}|${c.week}`));
-
-  const body = state.staff.map((s) => {
-    const perWeek = state.load[s.id] || {};
-    const total = Object.values(perWeek).reduce((a, b) => a + b, 0);
-    return el("tr", {},
-      el("td", {}, s.name),
-      el("td", { class: "muted tight" }, s.id),
-      state.weeks.map((w) => {
-        const mins = perWeek[w.number] || 0;
-        const bad = clashCells.has(`${s.id}|${w.number}`);
-        return el("td", {
-          class: "mid tight",
-          style: bad
-            ? "background:var(--clash-wash);color:var(--clash);font-weight:600"
-            : (mins ? "" : "color:var(--quiet)"),
-          title: bad ? `Clash in week ${w.number}` : "",
-        }, mins ? hours(mins) : ".");
-      }),
-      el("td", { class: "num tight" }, hours(total)));
-  });
-
-  const totals = state.weeks.map((w) => {
-    const sum = state.staff.reduce(
-      (acc, s) => acc + ((state.load[s.id] || {})[w.number] || 0), 0);
-    return el("td", { class: "mid tight" }, sum ? hours(sum) : "");
-  });
-
-  return [
-    el("section", { class: "panel" },
-      el("h2", {}, "Teaching hours by week"),
-      el("p", { class: "hint" },
-        "Timetabled contact hours only. Cancelled classes count as zero, and "
-        + "supervision, marking and admin are not included."),
-      el("div", { class: "scroll", style: "margin-top:0.7rem" },
-        el("table", {},
-          el("thead", {}, el("tr", {},
-            el("th", {}, "Staff"),
-            el("th", {}, "ID"),
-            state.weeks.map((w) => el("th", { class: "mid" }, w.number)),
-            el("th", { class: "num" }, "Total"))),
-          el("tbody", {}, body),
-          el("tfoot", {}, el("tr", {},
-            el("th", {}, "All staff"),
-            el("th", {}),
-            totals,
-            el("th", { class: "num" },
-              hours(state.classes.reduce((a, c) => a + c.minutes, 0)))))))),
-  ];
-}
-
-// ------------------------------------------------------------ timetable
-
-// ----------------------------------------------- timetable, clashes and fixes
-
-// Which clash panel is open, and the availability lists it needs. Held as
-// state and drawn during the normal render, so nothing depends on splicing a
-// panel into the page after the fact.
-let resolving = null;      // { index, a: [...], b: [...] }
-let focusedClash = null;   // index of the pair being singled out
-
-const sameClass = (cls, row) =>
-  cls.course_code === row.course_code && cls.section === row.section;
-
-function clashesForRow(row) {
-  // A row can be caught in more than one clash, and a section split across two
-  // rows only belongs to the clashes that fall in its own weeks.
-  return state.problems
-    .map((p, i) => ({ p, i }))
-    .filter(({ p }) =>
-      [p.a, p.b].some((c) =>
-        sameClass(c, row) && p.weeks.some((w) => row.weeks.includes(w))))
-    .map(({ i }) => i);
-}
-
-function clashBadge(index, { small = false } = {}) {
-  return el("button", {
-    class: "badge" + (focusedClash === index ? " focused" : "") + (small ? " sm" : ""),
-    title: `Clash ${index + 1}. Click to single it out.`,
-    onclick: () => {
-      focusedClash = focusedClash === index ? null : index;
-      render();
-    },
-  }, index + 1);
-}
-
-async function openResolve(problem, index) {
-  const ask = (c) => api("POST", "/api/availability", {
-    day: c.day, start: c.start, end: c.end, weeks: problem.weeks,
-    course_code: c.course_code, section: c.section,
-  });
-  try {
-    const [a, b] = await Promise.all([ask(problem.a), ask(problem.b)]);
-    resolving = { index, a: a.staff, b: b.staff };
-    focusedClash = index;
-    render();
-  } catch (err) {
-    toast(err.message, true);
-  }
-}
-
-function candidateList(problem, c, people, side) {
-  // Whoever could actually take it comes first, least loaded at the top. An
-  // alphabetical list buries the only useful answers at the bottom.
-  const sorted = [...people].sort((x, y) =>
-    (y.free - x.free) || (x.minutes - y.minutes) || x.name.localeCompare(y.name));
-  const name = `cand-${side}`;
-  const scopeName = `scope-${side}`;
-
-  return el("div", { class: "side" },
-    el("h4", {}, "Hand over ", c.label),
-    el("div", { class: "when" }, dayDot(c.day), `${c.day} ${c.start} to ${c.end}`),
-    el("div", { class: "candidates" },
-      sorted.map((s) =>
-        el("label", {
-          class: "cand" + (s.free ? "" : " busy")
-            + (s.id === problem.staff_id ? " current" : ""),
-        },
-          el("input", { type: "radio", name, value: s.id, disabled: !s.free }),
-          el("span", { class: "who" }, s.name),
-          s.free
-            ? el("span", { class: "hrs" }, `${hours(s.minutes)} hrs`)
-            : el("span", { class: "why" },
-                `busy ${weekRanges(s.busy_weeks).toLowerCase()}`)))),
-    el("div", { class: "scope" },
-      el("label", {},
-        el("input", { type: "radio", name: scopeName, value: "all", checked: true }),
-        "Every week it runs"),
-      el("label", {},
-        el("input", { type: "radio", name: scopeName, value: "clashing" }),
-        `Only ${weekRanges(problem.weeks).toLowerCase()}, splitting the row`)),
-    el("p", { class: "hint", style: "margin:0.35rem 0 0" },
-      "Either way this changes the timetable. Splitting leaves the original row "
-      + "with the weeks it still covers and adds a second row for the rest, so "
-      + "who teaches when stays visible in the table below."),
-    el("div", { class: "toolbar", style: "margin:0.7rem 0 0" },
-      el("button", {
-        class: "action primary",
-        onclick: async () => {
-          const picked = document.querySelector(`input[name="${name}"]:checked`);
-          if (!picked) return toast("Choose someone who is free.", true);
-          const scope = document.querySelector(
-            `input[name="${scopeName}"]:checked`).value;
-          try {
-            const res = await api("POST", "/api/reassign", {
-              course_code: c.course_code,
-              section: c.section,
-              staff_id: picked.value,
-              weeks: scope === "all" ? null : problem.weeks,
-            });
-            resolving = null;
-            focusedClash = null;
-            await refresh();
-            toast(res.split
-              ? `${c.label} split, ${staffName(picked.value)} takes `
-                + weekRanges(problem.weeks).toLowerCase()
-              : `${c.label} handed to ${staffName(picked.value)}`);
-          } catch (err) { toast(err.message, true); }
-        },
-      }, "Hand it over")));
-}
-
-function clashPanel() {
-  if (!state.problems.length) {
-    return el("section", { class: "panel ok" },
-      el("h2", {}, "Nothing clashes"),
-      el("p", { class: "hint" },
-        "Nobody in the staff list is timetabled twice at once. Teaching outside "
-        + "these courses is not tracked, so this is not a statement about "
-        + "anyone's overall availability."));
+  if (!state.staff.length || !weeks.length) {
+    wrap.append(emptyPanel("Nothing to add up yet",
+      "Add staff and a teaching calendar on Setup."));
+    return wrap;
   }
 
-  const rows = state.problems.flatMap((p, i) => {
-    const open = resolving && resolving.index === i;
-    const row = el("div", {
-      class: "clash" + (focusedClash === i ? " focused" : "")
-        + (focusedClash !== null && focusedClash !== i ? " dimmed" : ""),
-    },
-      clashBadge(i),
-      el("div", { class: "pair" },
-        el("div", { class: "who" }, staffName(p.staff_id)),
-        el("div", { class: "vs" },
-          dayDot(p.a.day), el("b", {}, p.a.label), ` ${p.a.start} to ${p.a.end}`,
-          el("span", { class: "muted" }, "  against  "),
-          dayDot(p.b.day), el("b", {}, p.b.label), ` ${p.b.start} to ${p.b.end}`)),
-      el("div", { class: "when" }, ribbonScale(), ribbon(p.weeks)),
-      el("div", { class: "weeks" }, weekRanges(p.weeks)),
-      el("button", {
-        class: "action",
-        onclick: () => {
-          if (open) { resolving = null; return render(); }
-          openResolve(p, i);
-        },
-      }, open ? "Close" : "Fix this"));
-
-    if (!open) return [row];
-    return [row, el("div", { class: "resolve" },
-      el("div", { class: "sides" },
-        candidateList(p, p.a, resolving.a, "a"),
-        candidateList(p, p.b, resolving.b, "b")))];
-  });
-
-  return el("section", { class: "panel" },
-    el("h2", {}, state.problems.length === 1
-      ? "One clash to sort out"
-      : `${state.problems.length} clashes to sort out`),
+  const panel = el("section", { class: "panel" },
+    el("h2", { text: "Contact hours" }),
     el("p", { class: "hint" },
-      "Each clash has a number, and both halves of the pair carry it in the "
-      + "table below. Click a number to single that pair out. Fix this shows "
-      + "who is free at that time, so handing a class over cannot create a new "
-      + "clash by accident."),
-    el("div", { class: "clashlist" }, rows));
-}
+      "Timetabled hours only, so this will not match a workload allocation that ",
+      "also covers supervision, marking and admin. A red figure is over that ",
+      "person's target."));
 
-function timetableView() {
-  const rows = state.timetable.map((r) => {
-    const mine = clashesForRow(r);
-    const dimmed = focusedClash !== null && !mine.includes(focusedClash);
-    return el("tr", {
-      class: (mine.length ? "hasclash " : "")
-        + (dimmed ? "dimmed" : "")
-        + (focusedClash !== null && mine.includes(focusedClash) ? " focused" : ""),
-    },
-      el("td", { class: "mid tight" },
-        mine.length
-          ? el("span", { class: "badges" }, mine.map((i) => clashBadge(i, { small: true })))
-          : el("span", { class: "muted" }, "")),
-      el("td", {}, el("div", {}, r.course_code),
-        el("div", { class: "muted" }, r.course_title)),
-      el("td", {}, r.section),
-      el("td", {}, staffName(r.staff_id)),
-      el("td", { class: "tight" },
-        dayDot(r.day), `${r.day.slice(0, 3)} ${r.start} to ${r.end}`),
-      el("td", { style: "min-width:9rem" }, ribbonScale(), ribbon(r.weeks, { light: true })),
-      el("td", { class: "tight" },
-        el("button", { class: "link", onclick: () => editTimetable(r) }, "Edit")));
-  });
+  const table = el("table", { class: "loadtable" });
+  table.append(el("thead", {}, el("tr", {},
+    el("th", { text: "Person" }),
+    weeks.map((w) => el("th", { class: "num", text: String(w) })),
+    el("th", { class: "num", text: "Total" }),
+    el("th", { class: "num", text: "Target" }))));
 
-  return [
-    issuesPanel(),
-    clashPanel(),
-    el("section", { class: "panel" },
-      el("div", { class: "toolbar" },
-        el("h2", {}, "The timetable as issued"),
-        el("span", { class: "spacer" }),
-        focusedClash !== null
-          ? el("button", {
-              class: "action",
-              onclick: () => { focusedClash = null; render(); },
-            }, "Show everything")
-          : null,
-        el("button", { class: "action primary", onclick: () => editTimetable(null) },
-          "Add a class")),
-      el("p", { class: "hint" },
-        "One row per course and section, with the weeks it runs. If a section "
-        + "changes lecturer partway through the semester, add a second row for "
-        + "the later weeks rather than using exceptions. Handing part of a "
-      + "semester to someone else does that splitting for you."),
-      rows.length
-        ? el("div", { class: "scroll", style: "margin-top:0.7rem" },
-            el("table", {},
-              el("thead", {}, el("tr", {},
-                el("th", { class: "mid" }, "Clash"),
-                el("th", {}, "Course"),
-                el("th", {}, "Section"),
-                el("th", {}, "Staff"),
-                el("th", {}, "When"),
-                el("th", {}, "Weeks"),
-                el("th", {}))),
-              el("tbody", {}, rows)))
-        : el("p", { class: "empty" }, "Nothing here yet. Add your first class.")),
-  ];
+  const body = el("tbody");
+  for (const person of state.staff) {
+    const byWeek = state.load[person.id] || {};
+    const total = Object.values(byWeek).reduce((sum, m) => sum + m, 0);
+    const target = person.target_minutes;
+
+    body.append(el("tr", {},
+      el("td", {},
+        el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
+        person.name),
+      weeks.map((week) => {
+        const minutes = byWeek[week] || 0;
+        const over = target && minutes > target;
+        return el("td", {
+          class: `num ${over ? "over" : ""} ${minutes ? "" : "zero"}`,
+          title: over ? `Over target by ${hours(minutes - target)} hours` : "",
+          text: minutes ? hours(minutes) : "·",
+        });
+      }),
+      el("td", { class: "num strong", text: hours(total) }),
+      el("td", { class: "num muted", text: target ? hours(target) : "—" })));
+  }
+  table.append(body);
+  panel.append(table);
+  wrap.append(panel);
+  return wrap;
 }
 
 // ------------------------------------------------------------ exceptions
 
 function exceptionsView() {
-  const rows = state.exceptions.map((x) =>
-    el("tr", {},
-      el("td", { class: "mid tight" }, x.week),
-      el("td", {}, `${x.course_code} ${x.section}`),
-      el("td", {}, x.action),
-      el("td", {}, x.staff_id ? staffName(x.staff_id) : el("span", { class: "muted" }, "unchanged")),
-      el("td", { class: "tight" },
-        x.action === "Cancel"
-          ? el("span", { class: "muted" }, "not running")
-          : describeOverride(x)),
-      el("td", { class: "muted" }, x.note),
-      el("td", { class: "tight" },
-        el("button", { class: "link", onclick: () => editException(x) }, "Edit"))));
+  const wrap = el("div", {}, staleServerBanner(), issuesPanel());
 
-  return [
-    issuesPanel(),
-    el("section", { class: "panel" },
-      el("div", { class: "toolbar" },
-        el("h2", {}, "Weeks that depart from the timetable"),
-        el("span", { class: "spacer" }),
-        el("button", { class: "action primary", onclick: () => editException(null) },
-          "Add an exception")),
-      el("p", { class: "hint" },
-        "For weeks that genuinely depart from the timetable. Not for staffing: "
-        + "if someone else is teaching, change the timetable so the table says "
-        + "so. Change alters one week and leaves everything you do not fill in "
-        + "as it was. Cancel means the class does not run. Add creates an extra "
-        + "class, so it needs every field."),
-      rows.length
-        ? el("div", { class: "scroll", style: "margin-top:0.7rem" },
-            el("table", {},
-              el("thead", {}, el("tr", {},
-                el("th", { class: "mid" }, "Week"),
-                el("th", {}, "Class"),
-                el("th", {}, "Action"),
-                el("th", {}, "Staff"),
-                el("th", {}, "Time"),
-                el("th", {}, "Note"),
-                el("th", {}))),
-              el("tbody", {}, rows)))
-        : el("p", { class: "empty" },
-            "No exceptions. Every class runs exactly as timetabled.")),
-  ];
+  const panel = el("section", { class: "panel" },
+    el("div", { class: "toolbar" },
+      el("h2", { text: "Exceptions" }),
+      el("span", { class: "spacer" }),
+      el("button", {
+        class: "action", text: "Add an exception",
+        onclick: () => editException(null),
+      })));
+
+  panel.append(el("p", { class: "hint" },
+    "Single weeks that depart from the timetable. Not for staffing: if somebody ",
+    "else is taking a week, assign that week to them on the Planner."));
+
+  if (!state.exceptions.length) {
+    panel.append(el("p", { class: "empty", text: "No exceptions." }));
+    wrap.append(panel);
+    return wrap;
+  }
+
+  const table = el("table", {},
+    el("thead", {}, el("tr", {},
+      el("th", { text: "Week" }), el("th", { text: "Class" }),
+      el("th", { text: "What" }), el("th", { text: "Note" }), el("th", {}))));
+
+  const body = el("tbody");
+  for (const exc of state.exceptions) {
+    body.append(el("tr", {},
+      el("td", { text: String(exc.week) }),
+      el("td", { text: `${exc.course_code} ${exc.section}` }),
+      el("td", {},
+        el("span", { class: `badge ${exc.action.toLowerCase()}`, text: exc.action }),
+        " ", describeOverride(exc)),
+      el("td", { class: "muted", text: exc.note || "" }),
+      el("td", { class: "right" },
+        el("button", { class: "link", text: "Edit", onclick: () => editException(exc) }))));
+  }
+  table.append(body);
+  panel.append(table);
+  wrap.append(panel);
+  return wrap;
 }
 
 function describeOverride(x) {
   const bits = [];
-  if (x.day) bits.push(x.day.slice(0, 3));
-  if (x.start && x.end) bits.push(`${x.start} to ${x.end}`);
-  else if (x.start) bits.push(`starts ${x.start}`);
-  else if (x.end) bits.push(`ends ${x.end}`);
-  return bits.length ? bits.join(" ") : el("span", { class: "muted" }, "unchanged");
+  if (x.day) bits.push(x.day);
+  if (x.start || x.end) bits.push(`${x.start || "?"}–${x.end || "?"}`);
+  if (x.action === "Add" && x.staff_id) bits.push(staffName(x.staff_id));
+  return bits.length ? bits.join(" ") : (x.action === "Cancel" ? "" : "no change given");
 }
 
 // ------------------------------------------------------------ setup
 
 function setupView() {
-  const staffRows = state.staff.map((s) =>
-    el("tr", {},
-      el("td", {}, s.id),
-      el("td", {}, s.name),
-      el("td", { class: "muted" }, s.email),
-      el("td", { class: "tight" },
-        el("button", { class: "link", onclick: () => editStaff(s) }, "Edit"))));
+  const wrap = el("div", {}, staleServerBanner(), issuesPanel());
 
-  const weekRows = state.weeks.map((w) =>
-    el("tr", {},
-      el("td", { class: "mid tight" }, w.number),
-      el("td", { class: "tight" },
-        el("input", {
-          type: "date", value: w.starts,
-          onchange: (e) => saveWeek(w.number, "starts", e.target.value),
-        })),
-      el("td", { class: "muted tight" }, shortDate(w.ends)),
-      el("td", {},
-        el("input", {
-          type: "text", value: w.note, style: "width:100%",
-          placeholder: "e.g. mid semester break follows",
-          onchange: (e) => saveWeek(w.number, "note", e.target.value),
-        }))));
+  // staff
+  const staffPanel = el("section", { class: "panel" },
+    el("div", { class: "toolbar" },
+      el("h2", { text: "Staff" }),
+      el("span", { class: "spacer" }),
+      el("button", { class: "action", text: "Add somebody", onclick: () => editStaff(null) })));
 
-  return [
-    issuesPanel(),
-    el("section", { class: "panel" },
-      el("div", { class: "toolbar" },
-        el("h2", {}, "Staff you are responsible for"),
-        el("span", { class: "spacer" }),
-        el("button", { class: "action primary", onclick: () => editStaff(null) },
-          "Add a person")),
-      staffRows.length
-        ? el("table", {},
-            el("thead", {}, el("tr", {},
-              el("th", {}, "ID"), el("th", {}, "Name"),
-              el("th", {}, "Email"), el("th", {}))),
-            el("tbody", {}, staffRows))
-        : el("p", { class: "empty" }, "No staff yet.")),
+  staffPanel.append(el("p", { class: "hint" },
+    "The people you are responsible for. A target is contact hours a week, and ",
+    "is optional."));
 
-    el("section", { class: "panel" },
-      el("div", { class: "toolbar" },
-        el("h2", {}, "Teaching calendar"),
-        el("span", { class: "spacer" }),
-        el("button", { class: "action", onclick: addWeek }, "Add a week"),
-        state.weeks.length
-          ? el("button", { class: "action", onclick: removeLastWeek }, "Remove last week")
-          : null),
-      el("p", { class: "hint" },
-        "Week numbers run consecutively through teaching. Breaks are gaps "
-        + "between dates, not extra weeks. Set the Monday and the rest of the "
-        + "week follows."),
+  if (state.staff.length) {
+    const table = el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "Name" }), el("th", { text: "Id" }),
+        el("th", { text: "Email" }), el("th", { class: "num", text: "Target" }),
+        el("th", {}))));
+    const body = el("tbody");
+    for (const person of state.staff) {
+      body.append(el("tr", {},
+        el("td", {},
+          el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
+          person.name),
+        el("td", { class: "muted", text: person.id }),
+        el("td", { class: "muted", text: person.email || "" }),
+        el("td", { class: "num muted", text: person.target_minutes ? `${hours(person.target_minutes)} h` : "—" }),
+        el("td", { class: "right" },
+          el("button", { class: "link", text: "Edit", onclick: () => editStaff(person) }))));
+    }
+    table.append(body);
+    staffPanel.append(table);
+  } else {
+    staffPanel.append(el("p", { class: "empty", text: "Nobody yet." }));
+  }
+  wrap.append(staffPanel);
+
+  wrap.append(importPanel());
+
+  // weeks
+  const weeksPanel = el("section", { class: "panel" },
+    el("div", { class: "toolbar" },
+      el("h2", { text: "Teaching calendar" }),
+      el("span", { class: "spacer" }),
+      el("button", { class: "action", text: "Add a week", onclick: addWeek }),
       state.weeks.length
-        ? el("table", { style: "margin-top:0.6rem" },
-            el("thead", {}, el("tr", {},
-              el("th", { class: "mid" }, "Week"), el("th", {}, "Monday"),
-              el("th", {}, "Sunday"), el("th", {}, "Note"))),
-            el("tbody", {}, weekRows))
-        : el("p", { class: "empty" }, "No teaching calendar yet.")),
+        ? el("button", { class: "link danger", text: "Remove the last week", onclick: removeLastWeek })
+        : null));
 
-    el("section", { class: "panel" },
-      el("h2", {}, "Sample data"),
-      el("p", { class: "hint" },
-        "The tool starts with two example courses that exercise every rule: a "
-        + "lecture running in three weeks only, workshops shortened in those "
-        + "weeks, a public holiday cancellation, a one week guest lecturer and "
-        + "an added crit session."),
-      el("div", { class: "toolbar", style: "margin-top:0.7rem" },
-        el("button", {
-          class: "action",
-          onclick: () => confirmThen(
-            "Replace everything with the sample data?",
-            () => api("POST", "/api/sample-data"), "Sample data loaded"),
-        }, "Reload sample data"),
-        el("button", {
-          class: "action",
-          onclick: () => confirmThen(
-            "Delete all staff, weeks, timetable rows and exceptions?",
-            () => api("DELETE", "/api/all-data"), "Everything cleared"),
-        }, "Clear everything"))),
-  ];
+  weeksPanel.append(el("p", { class: "hint" },
+    "Weeks are numbered consecutively through teaching, so a mid semester break ",
+    "is a gap between dates rather than an extra week."));
+
+  if (state.weeks.length) {
+    const table = el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "Week" }), el("th", { text: "Monday" }),
+        el("th", { text: "Ends" }), el("th", { text: "Note" }))));
+    const body = el("tbody");
+    for (const week of state.weeks) {
+      body.append(el("tr", {},
+        el("td", { text: String(week.number) }),
+        el("td", {}, el("input", {
+          type: "date", value: week.starts,
+          onchange: (e) => saveWeek(week.number, "starts", e.target.value),
+        })),
+        el("td", { class: "muted", text: shortDate(week.ends) }),
+        el("td", {}, el("input", {
+          type: "text", value: week.note || "", placeholder: "—",
+          onchange: (e) => saveWeek(week.number, "note", e.target.value),
+        }))));
+    }
+    table.append(body);
+    weeksPanel.append(table);
+  } else {
+    weeksPanel.append(el("p", { class: "empty", text: "No weeks yet." }));
+  }
+  wrap.append(weeksPanel);
+
+  // data
+  wrap.append(el("section", { class: "panel" },
+    el("h2", { text: "Sample data" }),
+    el("p", { class: "hint" },
+      "The sample timetable shows the states this tool distinguishes: a split ",
+      "semester, a section nobody covers, a cancelled week and an added class."),
+    el("div", { class: "toolbar" },
+      el("button", {
+        class: "action", text: "Reload the sample data",
+        onclick: () => confirmThen(
+          "Replace everything with the sample data?",
+          () => api("POST", "/api/sample-data"), "Sample data loaded."),
+      }),
+      el("button", {
+        class: "link danger", text: "Clear everything",
+        onclick: () => confirmThen(
+          "Delete all staff, timetable, staffing and exceptions?",
+          () => api("DELETE", "/api/all-data"), "Everything cleared."),
+      }))));
+
+  return wrap;
 }
 
-async function confirmThen(question, action, done) {
-  if (!confirm(question)) return;
+// ------------------------------------------------------------ import
+
+let importPreview = null;
+
+function importPanel() {
+  const panel = el("section", { class: "panel" },
+    el("h2", { text: "Import a timetable" }));
+
+  panel.append(el("p", { class: "hint" },
+    "A CSV or Excel file with a header row and columns for course code, section, ",
+    "day, start, end and weeks. Weeks can be written 1-6, 8, 10-12. Staffing is ",
+    "kept wherever the same class still runs in the same week."));
+
+  panel.append(el("div", { class: "toolbar" },
+    el("input", {
+      type: "file", id: "importfile", accept: ".csv,.tsv,.xlsx,.xlsm",
+      onchange: (e) => previewImport(e.target.files[0]),
+    })));
+
+  if (!importPreview) return panel;
+
+  const { rows, issues, would_drop: drop } = importPreview;
+
+  if (issues.length) {
+    panel.append(el("div", { class: "issues" },
+      el("strong", { text: issues.length === 1 ? "One row could not be read" : `${issues.length} rows could not be read` }),
+      el("ul", {}, issues.map((i) => el("li", { text: i })))));
+  }
+
+  panel.append(el("p", {},
+    el("strong", { text: `${rows.length} classes read.` }),
+    ` They would replace the ${importPreview.replacing} now in the timetable.`));
+
+  if (drop.length) {
+    panel.append(el("div", { class: "issues" },
+      el("strong", { text: `${drop.length} staffed week${drop.length > 1 ? "s" : ""} would be lost` }),
+      el("p", { class: "hint", text: "These classes are not in the new file, or not in those weeks." }),
+      el("ul", {}, drop.slice(0, 12).map((d) =>
+        el("li", { text: `${d.course_code} ${d.section} week ${d.week}: ${staffName(d.staff_id)}` }))),
+      drop.length > 12 ? el("p", { class: "muted", text: `and ${drop.length - 12} more.` }) : null));
+  }
+
+  if (rows.length) {
+    const table = el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "Class" }), el("th", { text: "Day" }),
+        el("th", { text: "Time" }), el("th", { text: "Weeks" }))));
+    const body = el("tbody");
+    for (const row of rows.slice(0, 40)) {
+      body.append(el("tr", {},
+        el("td", { text: `${row.course_code} ${row.section}` }),
+        el("td", {}, dayDot(row.day), row.day),
+        el("td", { text: `${row.start}–${row.end}` }),
+        el("td", { text: weekRanges(row.weeks) })));
+    }
+    table.append(body);
+    panel.append(table);
+    if (rows.length > 40) {
+      panel.append(el("p", { class: "muted", text: `and ${rows.length - 40} more.` }));
+    }
+
+    panel.append(el("div", { class: "toolbar" },
+      el("button", {
+        class: "action primary", text: "Replace the timetable",
+        onclick: () => commitImport("replace"),
+      }),
+      el("button", {
+        class: "action", text: "Add to what is there",
+        onclick: () => commitImport("append"),
+      }),
+      el("button", {
+        class: "link", text: "Cancel",
+        onclick: () => { importPreview = null; render(); },
+      })));
+  }
+
+  return panel;
+}
+
+async function previewImport(file) {
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
   try {
-    await action();
-    await refresh();
-    toast(done);
-  } catch (err) {
-    toast(err.message, true);
+    importPreview = await api("POST", "/api/import/preview", form);
+    render();
+  } catch (error) {
+    importPreview = null;
+    toast(error.message, true);
+    render();
   }
 }
 
-const sixDaysOn = (iso) =>
-  new Date(new Date(iso + "T00:00:00").getTime() + 6 * 86400000)
-    .toISOString().slice(0, 10);
+async function commitImport(mode) {
+  if (mode === "replace") {
+    const ok = await confirmDialog(
+      "Replace the timetable?",
+      `The ${importPreview.replacing} classes now in the timetable will be replaced by ` +
+      `${importPreview.rows.length} from the file. Staffing is kept where the same class ` +
+      `still runs in the same week.`);
+    if (!ok) return;
+  }
+  try {
+    const result = await api("POST", "/api/import/commit",
+      { rows: importPreview.rows, mode });
+    importPreview = null;
+    $("#importfile") && ($("#importfile").value = "");
+    toast(result.kept
+      ? `Imported ${result.added} classes, keeping ${result.kept} staffed weeks.`
+      : `Imported ${result.added} classes.`);
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+// ------------------------------------------------------------ weeks editing
+
+async function confirmThen(question, action, done) {
+  if (!(await confirmDialog("Are you sure?", question))) return;
+  try {
+    await action();
+    toast(done);
+    importPreview = null;
+    openRow = null;
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+const sixDaysOn = (iso) => {
+  const d = new Date(iso + "T00:00:00");
+  d.setDate(d.getDate() + 6);
+  return d.toISOString().slice(0, 10);
+};
 
 async function saveWeek(number, field, value) {
-  const weeks = state.weeks.map((w) => {
-    if (w.number !== number) return { ...w };
-    const next = { ...w, [field]: value };
-    if (field === "starts") next.ends = sixDaysOn(value);
-    return next;
-  });
+  const weeks = state.weeks.map((w) => ({
+    number: w.number,
+    starts: w.number === number && field === "starts" ? value : w.starts,
+    ends: w.number === number && field === "starts" ? sixDaysOn(value) : w.ends,
+    note: w.number === number && field === "note" ? value : w.note,
+  }));
   try {
     await api("PUT", "/api/weeks", { weeks });
     await refresh();
-  } catch (err) {
-    toast(err.message, true);
+  } catch (error) {
+    toast(error.message, true);
   }
 }
 
 async function addWeek() {
   const last = state.weeks[state.weeks.length - 1];
-  const next = last
-    ? new Date(new Date(last.starts + "T00:00:00").getTime() + 7 * 86400000)
-    : new Date();
-  const iso = next.toISOString().slice(0, 10);
-  const weeks = [...state.weeks.map((w) => ({ ...w })),
-    { number: (last ? last.number : 0) + 1, starts: iso,
-      ends: sixDaysOn(iso), note: "" }];
+  const starts = last
+    ? (() => { const d = new Date(last.starts + "T00:00:00"); d.setDate(d.getDate() + 7);
+               return d.toISOString().slice(0, 10); })()
+    : new Date().toISOString().slice(0, 10);
+  const weeks = [
+    ...state.weeks.map((w) => ({ ...w })),
+    { number: (last ? last.number : 0) + 1, starts, ends: sixDaysOn(starts), note: "" },
+  ];
   await api("PUT", "/api/weeks", { weeks });
   await refresh();
 }
@@ -935,157 +1114,173 @@ async function removeLastWeek() {
 
 function issuesPanel() {
   if (!state.issues.length) return null;
-  return el("section", { class: "panel issues" },
-    el("h3", {}, state.issues.length === 1
-      ? "One thing needs attention in the data"
-      : `${state.issues.length} things need attention in the data`),
-    el("p", { class: "hint" },
-      "These are problems with the records themselves, not with the timetable. "
-      + "Clash detection may be wrong until they are fixed."),
-    el("ul", {}, state.issues.map((i) => el("li", {}, i))));
+  return el("div", { class: "issues" },
+    el("strong", { text: state.issues.length === 1 ? "A problem with the records" : "Problems with the records" }),
+    el("ul", {}, state.issues.map((i) => el("li", { text: i }))));
 }
 
 function emptyPanel(heading, hint) {
   return el("section", { class: "panel" },
-    el("h2", {}, heading),
-    el("p", { class: "hint" }, hint));
+    el("h2", { text: heading }),
+    el("p", { class: "hint", text: hint }));
 }
 
-// ------------------------------------------------------------ editor dialog
+// ------------------------------------------------------------ dialogs
 
-let saveHandler = null;
+function confirmDialog(title, question) {
+  return new Promise((resolve) => {
+    const dialog = $("#editor");
+    $("#editor-title").textContent = title;
+    const body = $("#editor-body");
+    body.replaceChildren(el("p", { text: question }));
+    $("#editor-delete").hidden = true;
+
+    const save = $("#editor-save");
+    save.textContent = "Yes";
+    const finish = (answer) => {
+      save.textContent = "Save";
+      dialog.close();
+      resolve(answer);
+    };
+    save.onclick = () => finish(true);
+    $("#editor-cancel").onclick = () => finish(false);
+    dialog.onclose = () => resolve(false);
+    dialog.showModal();
+  });
+}
 
 function openEditor(title, fields, onSave, onDelete) {
+  const dialog = $("#editor");
   $("#editor-title").textContent = title;
-  const body = $("#editor-body");
-  body.replaceChildren(...fields);
-  saveHandler = onSave;
-  const del = $("#editor-delete");
-  del.hidden = !onDelete;
-  del.onclick = async () => {
-    if (!confirm("Delete this permanently?")) return;
+  $("#editor-body").replaceChildren(...fields);
+
+  const remove = $("#editor-delete");
+  remove.hidden = !onDelete;
+  remove.onclick = async () => {
+    if (!(await confirmDialog("Delete this?", "This cannot be undone."))) return;
     try {
       await onDelete();
-      $("#editor").close();
+      dialog.close();
+      openRow = null;
       await refresh();
-      toast("Deleted");
-    } catch (err) { toast(err.message, true); }
+      toast("Deleted.");
+    } catch (error) { toast(error.message, true); }
   };
-  $("#editor").showModal();
+
+  $("#editor-save").textContent = "Save";
+  $("#editor-save").onclick = async () => {
+    try {
+      await onSave();
+      dialog.close();
+      await refresh();
+      toast("Saved.");
+    } catch (error) { toast(error.message, true); }
+  };
+  $("#editor-cancel").onclick = () => dialog.close();
+  dialog.onclose = null;
+  dialog.showModal();
 }
 
-$("#editor-cancel").onclick = () => $("#editor").close();
-$("#editor-save").onclick = async () => {
-  try {
-    await saveHandler();
-    $("#editor").close();
-    await refresh();
-    toast("Saved");
-  } catch (err) {
-    toast(err.message, true);
-  }
-};
-
 function field(label, input) {
-  return el("div", { class: "field" }, el("label", {}, label), input);
+  return el("label", { class: "field" }, el("span", { text: label }), input);
 }
 
 function textInput(id, value, opts = {}) {
-  return el("input", { id, type: opts.type || "text", value: value ?? "",
-    placeholder: opts.placeholder || "" });
+  return el("input", { id, value: value ?? "", type: opts.type || "text",
+                       placeholder: opts.placeholder || "" });
 }
 
 function staffSelect(id, value, { allowBlank = false, blankLabel = "" } = {}) {
-  return el("select", { id },
-    allowBlank ? el("option", { value: "", selected: !value }, blankLabel) : null,
-    state.staff.map((s) =>
-      el("option", { value: s.id, selected: s.id === value }, `${s.name} (${s.id})`)));
+  const select = el("select", { id });
+  if (allowBlank) select.append(el("option", { value: "", text: blankLabel }));
+  for (const person of state.staff) {
+    select.append(el("option", { value: person.id, selected: person.id === value },
+      person.name));
+  }
+  return select;
 }
 
 function daySelect(id, value, { allowBlank = false } = {}) {
-  return el("select", { id },
-    allowBlank ? el("option", { value: "", selected: !value }, "Unchanged") : null,
-    DAYS.map((d) => el("option", { value: d, selected: d === value }, d)));
+  const select = el("select", { id });
+  if (allowBlank) select.append(el("option", { value: "", text: "unchanged" }));
+  for (const day of DAYS) {
+    select.append(el("option", { value: day, selected: day === value }, day));
+  }
+  return select;
 }
 
 function weekTicks(id, selected) {
-  // A new class usually runs every week, so that is the starting point.
-  const chosen = new Set(selected ?? state.weeks.map((w) => w.number));
-  const ticks = el("div", { class: "weekticks", id },
-    state.weeks.map((w) =>
-      el("label", { class: chosen.has(w.number) ? "checked" : "" },
-        el("input", {
-          type: "checkbox", value: w.number, checked: chosen.has(w.number),
-          onchange: (e) => e.target.closest("label")
-            .classList.toggle("checked", e.target.checked),
-        }),
-        w.number)));
-
-  const setAll = (on) => {
-    ticks.querySelectorAll("input").forEach((box) => {
-      box.checked = on;
-      box.closest("label").classList.toggle("checked", on);
+  const chosen = new Set(selected || []);
+  const box = el("div", { class: "weekticks", id });
+  for (const week of weekNumbers()) {
+    const button = el("button", {
+      class: chosen.has(week) ? "tick on" : "tick",
+      text: String(week),
+      "data-week": week,
+      onclick: (e) => {
+        e.preventDefault();
+        const on = e.target.classList.toggle("on");
+        if (on) chosen.add(week); else chosen.delete(week);
+      },
     });
-  };
-
-  return el("div", {},
-    ticks,
-    el("div", { class: "toolbar", style: "margin:0.4rem 0 0" },
-      el("button", { class: "link", onclick: () => setAll(true) }, "Tick all"),
-      el("button", { class: "link", onclick: () => setAll(false) }, "Clear")));
+    box.append(button);
+  }
+  const tools = el("div", { class: "toolbar" },
+    el("button", {
+      class: "link", text: "All",
+      onclick: (e) => {
+        e.preventDefault();
+        box.querySelectorAll(".tick").forEach((t) => t.classList.add("on"));
+        weekNumbers().forEach((w) => chosen.add(w));
+      },
+    }),
+    el("button", {
+      class: "link", text: "None",
+      onclick: (e) => {
+        e.preventDefault();
+        box.querySelectorAll(".tick").forEach((t) => t.classList.remove("on"));
+        chosen.clear();
+      },
+    }));
+  return el("div", {}, box, tools);
 }
 
 const ticked = (id) =>
-  [...document.querySelectorAll(`#${id} input:checked`)].map((i) => Number(i.value));
+  [...document.querySelectorAll(`#${id} .tick.on`)]
+    .map((t) => Number(t.dataset.week)).sort((a, b) => a - b);
 
 const val = (id) => {
   const node = document.getElementById(id);
   return node ? node.value.trim() : "";
 };
+
 const orNull = (id) => val(id) || null;
 
 // ------------------------------------------------------------ editors
 
 function editTimetable(row) {
   const fields = [
-    el("div", { class: "row" },
-      field("Course code", textInput("f-code", row?.course_code, { placeholder: "111.701" })),
-      field("Section", textInput("f-section", row?.section, { placeholder: "A" }))),
-    field("Course title", textInput("f-title", row?.course_title)),
-    field("Staff member", staffSelect("f-staff", row?.staff_id,
-      { allowBlank: true, blankLabel: "Not one of our staff" })),
-    el("div", { class: "row" },
-      field("Day", daySelect("f-day", row?.day || "Monday")),
-      field("Starts", textInput("f-start", row?.start || "09:00", { type: "time" })),
-      field("Ends", textInput("f-end", row?.end || "12:00", { type: "time" }))),
-    field("Weeks it runs", weekTicks("f-weeks", row?.weeks)),
+    field("Course code", textInput("tt-code", row?.course_code, { placeholder: "111.701" })),
+    field("Course title", textInput("tt-title", row?.course_title)),
+    field("Section", textInput("tt-section", row?.section, { placeholder: "A" })),
+    field("Day", daySelect("tt-day", row?.day || "Monday")),
+    field("Starts", textInput("tt-start", row?.start || "09:00", { type: "time" })),
+    field("Ends", textInput("tt-end", row?.end || "11:00", { type: "time" })),
+    field("Weeks", weekTicks("tt-weeks", row?.weeks || weekNumbers())),
+    el("p", { class: "hint" },
+      "The timetable is set outside this tool, so this is for corrections. Who ",
+      "teaches it is decided on the Planner."),
   ];
 
-  const collect = () => ({
-    course_code: val("f-code"),
-    course_title: val("f-title"),
-    section: val("f-section"),
-    staff_id: orNull("f-staff"),
-    day: val("f-day"),
-    start: val("f-start"),
-    end: val("f-end"),
-    weeks: ticked("f-weeks"),
-  });
-
-  openEditor(
-    row ? `${row.course_code} ${row.section}` : "Add a class",
-    fields,
-    async () => {
-      const body = collect();
-      if (!body.course_code || !body.section) {
-        throw new Error("A class needs a course code and a section.");
-      }
-      if (!body.weeks.length) {
-        throw new Error("Tick at least one week, or the class never runs.");
-      }
-      if (body.end <= body.start) {
-        throw new Error("The finish time must be after the start time.");
-      }
+  openEditor(row ? `${row.course_code} ${row.section}` : "A class", fields,
+    () => {
+      const body = {
+        course_code: val("tt-code"), course_title: val("tt-title"),
+        section: val("tt-section"), day: val("tt-day"),
+        start: val("tt-start"), end: val("tt-end"),
+        weeks: ticked("tt-weeks"),
+      };
+      if (!body.course_code || !body.section) throw new Error("A course code and section are needed.");
       return row
         ? api("PUT", `/api/timetable/${row.id}`, body)
         : api("POST", "/api/timetable", body);
@@ -1093,90 +1288,79 @@ function editTimetable(row) {
     row ? () => api("DELETE", `/api/timetable/${row.id}`) : null);
 }
 
-function editException(row) {
-  const sections = [...new Set(state.timetable.map(
-    (r) => `${r.course_code}|${r.section}`))].sort();
+function editException(exc) {
+  const actionSelect = el("select", { id: "ex-action" },
+    ["Change", "Cancel", "Add"].map((a) =>
+      el("option", { value: a, selected: exc?.action === a }, a)));
+
+  const staffRow = field("Staff", staffSelect("ex-staff", exc?.staff_id,
+    { allowBlank: true, blankLabel: "nobody yet" }));
+
+  const showStaff = () => {
+    staffRow.hidden = val("ex-action") !== "Add";
+  };
+  actionSelect.addEventListener("change", showStaff);
 
   const fields = [
-    el("div", { class: "row" },
-      field("Week", el("select", { id: "f-week" },
-        state.weeks.map((w) => el("option",
-          { value: w.number, selected: w.number === row?.week },
-          `Week ${w.number}`)))),
-      field("Class", el("select", { id: "f-class" },
-        sections.map((key) => {
-          const [code, section] = key.split("|");
-          const selected = row && row.course_code === code && row.section === section;
-          return el("option", { value: key, selected }, `${code} ${section}`);
-        }))),
-      field("Action", el("select", { id: "f-action" },
-        ["Change", "Cancel", "Add"].map((a) =>
-          el("option", { value: a, selected: a === row?.action }, a))))),
-    field("Staff member", staffSelect("f-staff", row?.staff_id,
-      { allowBlank: true, blankLabel: "Unchanged" })),
-    el("div", { class: "row" },
-      field("Day", daySelect("f-day", row?.day, { allowBlank: true })),
-      field("Starts", textInput("f-start", row?.start, { type: "time" })),
-      field("Ends", textInput("f-end", row?.end, { type: "time" }))),
-    field("Note", textInput("f-note", row?.note,
-      { placeholder: "why this week is different" })),
+    field("Week", textInput("ex-week", exc?.week ?? "", { type: "number" })),
+    field("Course code", textInput("ex-code", exc?.course_code)),
+    field("Section", textInput("ex-section", exc?.section)),
+    field("What", actionSelect),
+    field("Day", daySelect("ex-day", exc?.day || "", { allowBlank: true })),
+    field("Starts", textInput("ex-start", exc?.start || "", { type: "time" })),
+    field("Ends", textInput("ex-end", exc?.end || "", { type: "time" })),
+    staffRow,
+    field("Note", textInput("ex-note", exc?.note)),
     el("p", { class: "hint" },
-      "Leave a field blank to keep what the timetable says. An added class has "
-      + "nothing to inherit, so it needs staff, day and both times."),
+      "A change alters one week; leave a field blank to keep what the timetable ",
+      "says. A cancelled class stays visible, struck through. An added class has ",
+      "no timetable row behind it, so it needs a day, both times and somebody to ",
+      "teach it."),
   ];
 
-  const collect = () => {
-    const [code, section] = val("f-class").split("|");
-    return {
-      week: Number(val("f-week")),
-      course_code: code,
-      section,
-      action: val("f-action"),
-      staff_id: orNull("f-staff"),
-      day: orNull("f-day"),
-      start: orNull("f-start"),
-      end: orNull("f-end"),
-      note: val("f-note"),
-    };
-  };
-
-  openEditor(
-    row ? "Edit exception" : "Add an exception",
+  openEditor(exc ? `Week ${exc.week}, ${exc.course_code} ${exc.section}` : "An exception",
     fields,
-    async () => {
-      const body = collect();
-      if (!body.course_code) throw new Error("Add a class to the timetable first.");
-      if (body.action === "Add") {
-        const missing = ["staff_id", "day", "start", "end"]
-          .filter((k) => !body[k]);
-        if (missing.length) {
-          throw new Error("An added class needs staff, day, start and finish.");
-        }
+    () => {
+      const action = val("ex-action");
+      const body = {
+        week: Number(val("ex-week")), course_code: val("ex-code"),
+        section: val("ex-section"), action,
+        day: orNull("ex-day"), start: orNull("ex-start"), end: orNull("ex-end"),
+        staff_id: action === "Add" ? orNull("ex-staff") : null,
+        note: val("ex-note"),
+      };
+      if (!body.week || !body.course_code || !body.section) {
+        throw new Error("A week, course code and section are needed.");
       }
-      if (body.start && body.end && body.end <= body.start) {
-        throw new Error("The finish time must be after the start time.");
-      }
-      return row
-        ? api("PUT", `/api/exceptions/${row.id}`, body)
+      return exc
+        ? api("PUT", `/api/exceptions/${exc.id}`, body)
         : api("POST", "/api/exceptions", body);
     },
-    row ? () => api("DELETE", `/api/exceptions/${row.id}`) : null);
+    exc ? () => api("DELETE", `/api/exceptions/${exc.id}`) : null);
+
+  setTimeout(showStaff, 0);
 }
 
 function editStaff(person) {
   const fields = [
-    el("div", { class: "row" },
-      field("ID", textInput("f-id", person?.id, { placeholder: "S01" })),
-      field("Name", textInput("f-name", person?.name, { placeholder: "Surname, First" }))),
-    field("Email", textInput("f-email", person?.email, { type: "email" })),
+    field("Name", textInput("st-name", person?.name, { placeholder: "Surname, First" })),
+    field("Id", textInput("st-id", person?.id, { placeholder: "surname" })),
+    field("Email", textInput("st-email", person?.email, { type: "email" })),
+    field("Target hours a week", textInput("st-target",
+      person?.target_minutes ? person.target_minutes / 60 : "",
+      { type: "number", placeholder: "optional" })),
+    el("p", { class: "hint" },
+      "The id is what the records use. Changing it carries their staffing with it."),
   ];
 
-  openEditor(
-    person ? person.name : "Add a person",
-    fields,
-    async () => {
-      const body = { id: val("f-id"), name: val("f-name"), email: val("f-email") };
-      if (!body.id || !body.name) throw new Error("A person needs an ID and a name.");
+  openEditor(person ? person.name : "Somebody new", fields,
+    () => {
+      const targetHours = val("st-target");
+      const body = {
+        id: val("st-id"), name: val("st-name"), email: val("st-email"),
+        target_minutes: targetHours ? Math.round(Number(targetHours) * 60) : null,
+      };
+      if (!body.id || !body.name) throw new Error("A name and an id are needed.");
       return person
         ? api("PUT", `/api/staff/${person.id}`, body)
         : api("POST", "/api/staff", body);
@@ -1187,32 +1371,53 @@ function editStaff(person) {
 // ------------------------------------------------------------ routing
 
 const VIEWS = {
+  dashboard: dashboardView,
+  planner: plannerView,
   staff: staffView,
   load: loadView,
-  timetable: timetableView,
   exceptions: exceptionsView,
   setup: setupView,
 };
 
-function render() {
-  main().replaceChildren(
-    ...[staleServerBanner(), ...VIEWS[view]()].filter(Boolean));
-  document.querySelectorAll("#tabs button").forEach((b) => {
-    b.setAttribute("aria-current", b.dataset.view === view ? "true" : "false");
-  });
+let current = "dashboard";
+
+function go(view) {
+  if (!VIEWS[view]) return;
+  if (current !== view) {
+    current = view;
+    openRow = null;
+    assignScope = null;
+    candidates = null;
+  }
+  location.hash = view;
+  render();
 }
 
-$("#tabs").addEventListener("click", (e) => {
-  const button = e.target.closest("button");
-  if (!button) return;
-  view = button.dataset.view;
-  resolving = null;
-  focusedClash = null;
-  render();
+function render() {
+  if (!state) return;
+  for (const button of document.querySelectorAll("#tabs button")) {
+    const on = button.dataset.view === current;
+    button.toggleAttribute("aria-current", on);
+    if (on) button.setAttribute("aria-current", "true");
+  }
+  main().replaceChildren(VIEWS[current]());
+}
+
+window.addEventListener("hashchange", () => {
+  const view = location.hash.slice(1);
+  if (VIEWS[view] && view !== current) { current = view; render(); }
 });
 
-refresh().catch((err) => {
-  main().replaceChildren(el("section", { class: "panel" },
-    el("h2", {}, "Could not load the data"),
-    el("p", { class: "hint" }, err.message)));
+for (const button of document.querySelectorAll("#tabs button")) {
+  button.addEventListener("click", () => go(button.dataset.view));
+}
+
+const initial = location.hash.slice(1);
+if (VIEWS[initial]) current = initial;
+
+refresh().catch((error) => {
+  main().replaceChildren(el("div", { class: "issues" },
+    el("strong", { text: "Could not reach the server. " }),
+    "Is python app.py still running? ",
+    el("span", { class: "muted", text: error.message })));
 });

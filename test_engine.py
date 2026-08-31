@@ -1,8 +1,11 @@
-"""Tests for the timetable engine.
+"""Engine tests.
 
-Every case here came out of the spreadsheet prototype and was checked against
-two real course outlines, so these are the behaviours the tool is known to need
-rather than ones invented to suit the code.
+The cases come from two real course outlines: a lecture running in three weeks
+only, workshops shortened in those weeks, a public holiday cancellation, a one
+week substitution, split semester teaching, and an added crit session.
+
+The tests that matter most are the ones about refusing an assignment, because
+that refusal is what the tool is for.
 """
 
 from datetime import date, time
@@ -11,364 +14,453 @@ import pytest
 
 from engine import (
     Action,
+    Assignment,
     Class,
     ExceptionRow,
     StaffMember,
     Status,
     TimetableRow,
     Week,
+    check_assignment,
     classes_for,
+    coverage,
     expand,
     find_clashes,
     find_problems,
+    group_assignments,
     load_by_staff,
-    who_is_free,
+    over_target,
     overlaps,
+    uncovered_rows,
     validate,
+    who_is_free,
 )
 
-ALL_WEEKS = frozenset(range(1, 13))
+ALL = frozenset(range(1, 13))
 
 
-# --------------------------------------------------------------- fixtures
+def t(text: str) -> time:
+    hh, mm = text.split(":")
+    return time(int(hh), int(mm))
 
 
-@pytest.fixture
-def weeks():
-    starts = [
-        date(2026, 2, 23), date(2026, 3, 2), date(2026, 3, 9), date(2026, 3, 16),
-        date(2026, 3, 23), date(2026, 3, 30), date(2026, 4, 20), date(2026, 4, 27),
-        date(2026, 5, 4), date(2026, 5, 11), date(2026, 5, 18), date(2026, 5, 25),
-    ]
-    return [Week(number=i + 1, starts=d, ends=d) for i, d in enumerate(starts)]
+def week(n: int) -> Week:
+    return Week(number=n, starts=date(2026, 2, 23), ends=date(2026, 3, 1))
 
 
-@pytest.fixture
-def staff():
-    return [StaffMember(id=f"S{n:02d}", name=f"Sample {n}") for n in range(1, 15)]
+def row(id, code, section, day, start, end, weeks=ALL, title="Course"):
+    return TimetableRow(
+        id=id,
+        course_code=code,
+        course_title=title,
+        section=section,
+        day=day,
+        start=t(start),
+        end=t(end),
+        weeks=frozenset(weeks),
+    )
 
 
-@pytest.fixture
-def timetable():
-    """The two real courses, plus a third that collides with the first."""
-    return [
-        TimetableRow(1, "111.701", "Course One", "A", "S01", "Tuesday",
-                     time(14, 0), time(17, 0), ALL_WEEKS),
-        TimetableRow(2, "111.701", "Course One", "B", "S02", "Tuesday",
-                     time(14, 0), time(17, 0), ALL_WEEKS),
-        TimetableRow(3, "111.701", "Course One", "C", "S03", "Tuesday",
-                     time(14, 0), time(17, 0), ALL_WEEKS),
-        TimetableRow(4, "222.702", "Course Two", "LEC", "S05", "Monday",
-                     time(9, 0), time(10, 0), frozenset({7, 8, 9})),
-        TimetableRow(5, "222.702", "Course Two", "WS-A", "S05", "Monday",
-                     time(9, 0), time(12, 0), ALL_WEEKS),
-        TimetableRow(6, "222.702", "Course Two", "WS-C", "S01", "Thursday",
-                     time(9, 0), time(12, 0), ALL_WEEKS),
-        TimetableRow(7, "333.703", "Course Three", "A", "S02", "Tuesday",
-                     time(15, 0), time(18, 0), ALL_WEEKS),
-    ]
+def assign(timetable_id, staff_id, weeks):
+    return [Assignment(timetable_id=timetable_id, week=w, staff_id=staff_id) for w in weeks]
 
 
-@pytest.fixture
-def exceptions():
-    return [
-        # Workshops shorten in lecture weeks so the lecturer is not double booked.
-        ExceptionRow(1, 7, "222.702", "WS-A", Action.CHANGE, start=time(10, 0),
-                     note="Lecture week"),
-        ExceptionRow(2, 9, "222.702", "WS-A", Action.CHANGE, start=time(10, 0),
-                     note="Lecture week"),
-        # ANZAC Day observed on the Monday of week 8.
-        ExceptionRow(3, 8, "222.702", "LEC", Action.CANCEL, note="ANZAC Day"),
-        ExceptionRow(4, 8, "222.702", "WS-A", Action.CANCEL, note="ANZAC Day"),
-        # A guest takes one week only.
-        ExceptionRow(5, 5, "111.701", "C", Action.CHANGE, staff_id="S08",
-                     note="Guest lecturer"),
-        # An extra crit session with no timetable row behind it.
-        ExceptionRow(6, 12, "111.701", "A", Action.ADD, staff_id="S01",
-                     day="Thursday", start=time(9, 0), end=time(12, 0),
-                     note="Extra crit"),
-    ]
+# ------------------------------------------------------------ overlap
 
-
-@pytest.fixture
-def classes(timetable, exceptions):
-    return expand(timetable, exceptions)
-
-
-def one(classes, week, code, section):
-    found = [c for c in classes if c.week == week and c.course_code == code
-             and c.section == section]
-    assert len(found) == 1, f"expected exactly one {code} {section} in week {week}"
-    return found[0]
-
-
-# --------------------------------------------------------------- overlap rule
-
-
-def klass(**kw):
-    base = dict(week=1, course_code="X", course_title="", section="A", staff_id="S01",
-                day="Monday", start=time(9, 0), end=time(12, 0),
-                status=Status.SCHEDULED)
-    return Class(**{**base, **kw})
-
-
-def test_touching_is_not_a_clash():
-    a = klass(start=time(9, 0), end=time(12, 0))
-    b = klass(section="B", start=time(12, 0), end=time(15, 0))
+def test_touching_is_not_overlapping():
+    a = Class(1, "A", "", "1", "kate", "Monday", t("09:00"), t("12:00"), Status.SCHEDULED)
+    b = Class(1, "B", "", "1", "kate", "Monday", t("12:00"), t("14:00"), Status.SCHEDULED)
     assert not overlaps(a, b)
 
 
-def test_partial_overlap_is_a_clash():
-    a = klass(start=time(9, 0), end=time(12, 0))
-    b = klass(section="B", start=time(11, 0), end=time(14, 0))
-    assert overlaps(a, b)
+def test_overlap_needs_the_same_person_day_and_week():
+    base = dict(course_title="", status=Status.SCHEDULED)
+    a = Class(1, "A", section="1", staff_id="kate", day="Monday",
+              start=t("09:00"), end=t("12:00"), **base)
+    same = Class(1, "B", section="1", staff_id="kate", day="Monday",
+                 start=t("11:00"), end=t("13:00"), **base)
+    other_person = Class(1, "B", section="1", staff_id="sam", day="Monday",
+                         start=t("11:00"), end=t("13:00"), **base)
+    other_day = Class(1, "B", section="1", staff_id="kate", day="Tuesday",
+                      start=t("11:00"), end=t("13:00"), **base)
+    other_week = Class(2, "B", section="1", staff_id="kate", day="Monday",
+                       start=t("11:00"), end=t("13:00"), **base)
+
+    assert overlaps(a, same)
+    assert not overlaps(a, other_person)
+    assert not overlaps(a, other_day)
+    assert not overlaps(a, other_week)
 
 
-def test_different_people_never_clash():
-    a = klass(staff_id="S01")
-    b = klass(staff_id="S02", section="B")
-    assert not overlaps(a, b)
+# ------------------------------------------------------------ expansion
+
+def test_a_row_becomes_one_class_per_week_it_runs():
+    tt = [row(1, "222.702", "LEC", "Monday", "09:00", "10:00", weeks=[7, 8, 9])]
+    classes = expand(tt, [], [])
+    assert [c.week for c in classes] == [7, 8, 9]
+    assert all(c.status is Status.SCHEDULED for c in classes)
 
 
-def test_different_weeks_never_clash():
-    a = klass(week=1)
-    b = klass(week=2, section="B")
-    assert not overlaps(a, b)
+def test_staffing_comes_from_assignments_not_the_timetable():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2, 3])]
+    classes = expand(tt, [], assign(1, "kate", [1, 2]))
+    assert [(c.week, c.staff_id) for c in classes] == [(1, "kate"), (2, "kate"), (3, None)]
 
 
-def test_cancelled_classes_never_clash():
-    a = klass()
-    b = klass(section="B", status=Status.CANCELLED)
-    assert not overlaps(a, b)
+def test_a_class_with_nobody_on_it_is_not_teaching_but_still_runs():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    only = expand(tt, [], [])[0]
+    assert only.runs
+    assert not only.covered
+    assert not only.is_teaching
 
 
-def test_unstaffed_classes_never_clash():
-    a = klass(staff_id=None)
-    b = klass(section="B", staff_id=None)
-    assert not overlaps(a, b)
+def test_a_change_moves_the_class_and_keeps_its_staffing():
+    tt = [row(1, "333.703", "LEC", "Wednesday", "11:00", "13:00", weeks=[4, 5])]
+    exc = [ExceptionRow(1, 5, "333.703", "LEC", Action.CHANGE, start=t("14:00"), end=t("16:00"))]
+    moved = [c for c in expand(tt, exc, assign(1, "ruth", [4, 5])) if c.week == 5][0]
+    assert moved.status is Status.CHANGED
+    assert (moved.start, moved.end) == (t("14:00"), t("16:00"))
+    assert moved.day == "Wednesday"          # untouched fields are inherited
+    assert moved.staff_id == "ruth"
 
 
-# --------------------------------------------------------------- expansion
-
-
-def test_a_row_produces_one_class_per_week_it_runs(classes):
-    lec = [c for c in classes if c.section == "LEC"]
-    assert sorted(c.week for c in lec) == [7, 8, 9]
-
-
-def test_untouched_weeks_are_scheduled(classes):
-    assert one(classes, 1, "222.702", "WS-A").status is Status.SCHEDULED
-
-
-def test_change_overrides_only_what_it_supplies(classes):
-    week5 = one(classes, 5, "111.701", "C")
-    assert week5.staff_id == "S08"          # supplied by the exception
-    assert week5.day == "Tuesday"           # inherited
-    assert week5.start == time(14, 0)       # inherited
-    assert week5.status is Status.CHANGED
-
-
-def test_cancel_removes_the_class_from_the_reckoning(classes):
-    cancelled = one(classes, 8, "222.702", "WS-A")
+def test_a_cancelled_class_keeps_its_person_but_stops_counting():
+    tt = [row(1, "222.702", "WS-A", "Monday", "10:00", "12:00", weeks=[7, 8])]
+    exc = [ExceptionRow(1, 8, "222.702", "WS-A", Action.CANCEL, note="ANZAC Day")]
+    cancelled = [c for c in expand(tt, exc, assign(1, "tai", [7, 8])) if c.week == 8][0]
     assert cancelled.status is Status.CANCELLED
-    assert cancelled.staff_id is None
-    assert cancelled.minutes == 0
+    assert cancelled.staff_id == "tai"       # so the week explains itself
+    assert not cancelled.runs
     assert not cancelled.is_teaching
+    assert cancelled.minutes == 0
 
 
-def test_cancel_keeps_the_class_visible(classes):
-    """A cancelled class must not vanish, or nobody can see why a week is empty."""
-    assert one(classes, 8, "222.702", "LEC").course_code == "222.702"
+def test_an_added_class_carries_its_own_staff():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[11])]
+    exc = [ExceptionRow(9, 11, "111.701", "A", Action.ADD, day="Thursday",
+                        start=t("13:00"), end=t("16:00"), staff_id="kate")]
+    added = [c for c in expand(tt, exc, []) if c.status is Status.ADDED][0]
+    assert added.staff_id == "kate"
+    assert added.exception_id == 9
+    assert added.timetable_row_id is None
 
 
-def test_add_creates_a_class_with_no_timetable_row(classes):
-    added = [c for c in classes if c.status is Status.ADDED]
-    assert len(added) == 1
-    assert added[0].week == 12
-    assert added[0].timetable_row_id is None
-    assert added[0].minutes == 180
+def test_a_split_semester_is_two_sets_of_weeks_on_one_row():
+    tt = [row(1, "222.702", "WS-C", "Thursday", "09:00", "12:00")]
+    assignments = assign(1, "wei", range(1, 7)) + assign(1, "ruth", range(7, 13))
+    classes = expand(tt, [], assignments)
+    assert {c.staff_id for c in classes if c.week <= 6} == {"wei"}
+    assert {c.staff_id for c in classes if c.week >= 7} == {"ruth"}
 
 
-# --------------------------------------------------------------- the real cases
+# ------------------------------------------------------------ the hard block
 
-
-def test_shortened_workshop_prevents_a_false_clash(classes):
-    """The lecturer runs the lecture and a workshop back to back in week 7."""
-    lecture = one(classes, 7, "222.702", "LEC")
-    workshop = one(classes, 7, "222.702", "WS-A")
-    assert lecture.staff_id == workshop.staff_id == "S05"
-    assert lecture.end == time(10, 0)
-    assert workshop.start == time(10, 0)
-    assert not overlaps(lecture, workshop)
-
-
-def test_without_the_shortening_it_would_clash(timetable):
-    """Guards the test above: the exception is doing real work."""
-    unshortened = expand(timetable, [])
-    lecture = one(unshortened, 7, "222.702", "LEC")
-    workshop = one(unshortened, 7, "222.702", "WS-A")
-    assert overlaps(lecture, workshop)
-
-
-def test_public_holiday_empties_the_week(classes):
-    assert classes_for(classes, "S05", week=8) == []
-
-
-def test_split_semester_teaching_needs_no_exceptions(staff):
-    """Staff A for weeks 1 to 6, Staff B for 7 to 12, as two timetable rows."""
-    split = [
-        TimetableRow(1, "444.704", "Course Four", "A", "S03", "Wednesday",
-                     time(9, 0), time(12, 0), frozenset(range(1, 7))),
-        TimetableRow(2, "444.704", "Course Four", "A", "S09", "Wednesday",
-                     time(9, 0), time(12, 0), frozenset(range(7, 13))),
+def test_an_assignment_that_would_double_book_is_refused():
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2]),
+        row(2, "111.701", "B", "Tuesday", "14:00", "17:00", weeks=[1, 2]),
     ]
-    result = expand(split, [])
-    assert len(result) == 12
-    assert one(result, 6, "444.704", "A").staff_id == "S03"
-    assert one(result, 7, "444.704", "A").staff_id == "S09"
-    assert find_clashes(result) == []
+    classes = expand(tt, [], assign(1, "kate", [1, 2]))
+    conflicts = check_assignment(classes, "kate", timetable_id=2, weeks=[1, 2])
+    assert [c.week for c in conflicts] == [1, 2]
+    assert conflicts[0].existing.label == "111.701 A"
+    assert conflicts[0].proposed.label == "111.701 B"
 
 
-# --------------------------------------------------------------- clashes
+def test_a_free_person_is_not_refused():
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2]),
+        row(2, "111.701", "B", "Tuesday", "14:00", "17:00", weeks=[1, 2]),
+    ]
+    classes = expand(tt, [], assign(1, "kate", [1, 2]))
+    assert check_assignment(classes, "sam", timetable_id=2, weeks=[1, 2]) == []
 
 
-def test_the_structural_clash_recurs_every_week(classes):
-    clashes = [c for c in find_clashes(classes) if c.staff_id == "S02"]
-    assert sorted(c.week for c in clashes) == list(range(1, 13))
+def test_only_the_weeks_that_actually_overlap_are_refused():
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=range(1, 13)),
+        row(2, "111.701", "B", "Tuesday", "14:00", "17:00", weeks=range(1, 13)),
+    ]
+    classes = expand(tt, [], assign(1, "kate", [5, 6]))
+    conflicts = check_assignment(classes, "kate", timetable_id=2, weeks=[1, 2, 3, 5])
+    assert [c.week for c in conflicts] == [5]
 
 
-def test_problems_collapse_recurring_clashes_into_one_row(classes):
+def test_a_person_does_not_conflict_with_the_class_being_offered_to_them():
+    """Extending somebody's own class to more weeks is not a clash with itself."""
+    tt = [row(1, "222.702", "WS-C", "Thursday", "09:00", "12:00", weeks=range(1, 13))]
+    classes = expand(tt, [], assign(1, "wei", range(1, 7)))
+    assert check_assignment(classes, "wei", timetable_id=1, weeks=list(range(1, 13))) == []
+
+
+def test_a_cancelled_week_does_not_block_an_assignment():
+    tt = [
+        row(1, "222.702", "WS-A", "Monday", "10:00", "12:00", weeks=[8]),
+        row(2, "222.702", "WS-B", "Monday", "10:00", "12:00", weeks=[8]),
+    ]
+    exc = [ExceptionRow(1, 8, "222.702", "WS-A", Action.CANCEL)]
+    classes = expand(tt, exc, assign(1, "tai", [8]))
+    assert check_assignment(classes, "tai", timetable_id=2, weeks=[8]) == []
+
+
+def test_a_changed_time_is_what_gets_checked():
+    """A class moved out of the way stops blocking; moved into the way, it blocks."""
+    tt = [
+        row(1, "333.703", "LEC", "Wednesday", "11:00", "13:00", weeks=[5]),
+        row(2, "444.704", "SEM", "Wednesday", "11:00", "13:00", weeks=[5]),
+    ]
+    moved = [ExceptionRow(1, 5, "333.703", "LEC", Action.CHANGE,
+                          start=t("14:00"), end=t("16:00"))]
+
+    blocked = expand(tt, [], assign(1, "ruth", [5]))
+    assert check_assignment(blocked, "ruth", timetable_id=2, weeks=[5])
+
+    cleared = expand(tt, moved, assign(1, "ruth", [5]))
+    assert check_assignment(cleared, "ruth", timetable_id=2, weeks=[5]) == []
+
+
+def test_an_added_class_blocks_like_any_other():
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[11]),
+        row(2, "555.705", "X", "Thursday", "14:00", "16:00", weeks=[11]),
+    ]
+    exc = [ExceptionRow(9, 11, "111.701", "A", Action.ADD, day="Thursday",
+                        start=t("13:00"), end=t("16:00"), staff_id="kate")]
+    classes = expand(tt, exc, [])
+    conflicts = check_assignment(classes, "kate", timetable_id=2, weeks=[11])
+    assert len(conflicts) == 1
+    assert conflicts[0].existing.status is Status.ADDED
+
+
+def test_an_added_class_can_itself_be_checked():
+    tt = [row(1, "111.701", "A", "Thursday", "14:00", "17:00", weeks=[11])]
+    exc = [ExceptionRow(9, 11, "222.702", "CRIT", Action.ADD, day="Thursday",
+                        start=t("13:00"), end=t("16:00"), staff_id="kate")]
+    classes = expand(tt, exc, assign(1, "kate", [11]))
+    assert check_assignment(classes, "kate", exception_id=9)
+
+
+def test_unassigning_frees_the_slot():
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1]),
+        row(2, "111.701", "B", "Tuesday", "14:00", "17:00", weeks=[1]),
+    ]
+    held = expand(tt, [], assign(1, "kate", [1]))
+    assert check_assignment(held, "kate", timetable_id=2, weeks=[1])
+
+    freed = expand(tt, [], [])
+    assert check_assignment(freed, "kate", timetable_id=2, weeks=[1]) == []
+
+
+def test_check_with_nothing_to_check_returns_nothing():
+    assert check_assignment([], "kate") == []
+
+
+# ------------------------------------------------------------ availability
+
+def test_who_is_free_reports_the_weeks_somebody_is_busy():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2, 3])]
+    classes = expand(tt, [], assign(1, "kate", [1, 3]))
+    busy = who_is_free(classes, ["kate", "sam"], "Tuesday", t("14:00"), t("17:00"), [1, 2, 3])
+    assert busy == {"kate": [1, 3], "sam": []}
+
+
+def test_who_is_free_ignores_the_row_being_staffed():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2])]
+    classes = expand(tt, [], assign(1, "kate", [1, 2]))
+    busy = who_is_free(classes, ["kate"], "Tuesday", t("14:00"), t("17:00"), [1, 2], ignoring=1)
+    assert busy == {"kate": []}
+
+
+# ------------------------------------------------------------ coverage
+
+def test_coverage_counts_class_weeks_that_need_somebody():
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2]),
+        row(2, "111.701", "B", "Tuesday", "14:00", "17:00", weeks=[1, 2]),
+    ]
+    cover = coverage(expand(tt, [], assign(1, "kate", [1, 2])))
+    assert (cover.total, cover.covered, cover.percent) == (4, 2, 50)
+    assert {c.label for c in cover.uncovered} == {"111.701 B"}
+
+
+def test_a_cancelled_week_needs_nobody():
+    tt = [row(1, "222.702", "WS-A", "Monday", "10:00", "12:00", weeks=[7, 8])]
+    exc = [ExceptionRow(1, 8, "222.702", "WS-A", Action.CANCEL)]
+    cover = coverage(expand(tt, exc, []))
+    assert cover.total == 1
+
+
+def test_uncovered_weeks_are_gathered_per_section():
+    tt = [row(1, "111.701", "D", "Tuesday", "14:00", "17:00", weeks=range(1, 13))]
+    rows = uncovered_rows(expand(tt, [], []))
+    assert len(rows) == 1
+    assert rows[0]["section"] == "D"
+    assert rows[0]["weeks"] == list(range(1, 13))
+
+
+def test_full_coverage_reports_no_rows():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    classes = expand(tt, [], assign(1, "kate", [1]))
+    assert coverage(classes).percent == 100
+    assert uncovered_rows(classes) == []
+
+
+# ------------------------------------------------------------ display
+
+def test_assignments_group_into_spans_per_row():
+    assignments = assign(1, "wei", range(1, 7)) + assign(1, "ruth", range(7, 13))
+    grouped = group_assignments(assignments)
+    assert grouped[1] == [
+        ("wei", tuple(range(1, 7))),
+        ("ruth", tuple(range(7, 13))),
+    ]
+
+
+# ------------------------------------------------------------ load
+
+def test_load_adds_up_contact_minutes_per_week():
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1]),
+        row(2, "222.702", "WS-A", "Monday", "10:00", "12:00", weeks=[1]),
+    ]
+    classes = expand(tt, [], assign(1, "kate", [1]) + assign(2, "kate", [1]))
+    assert load_by_staff(classes) == {"kate": {1: 300}}
+
+
+def test_a_cancelled_class_is_not_load():
+    tt = [row(1, "222.702", "WS-A", "Monday", "10:00", "12:00", weeks=[7, 8])]
+    exc = [ExceptionRow(1, 8, "222.702", "WS-A", Action.CANCEL)]
+    assert load_by_staff(expand(tt, exc, assign(1, "tai", [7, 8]))) == {"tai": {7: 120}}
+
+
+def test_over_target_names_the_weeks_somebody_is_past_their_target():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2])]
+    classes = expand(tt, [], assign(1, "kate", [1, 2]))
+    staff = [
+        StaffMember("kate", "Ahern, Kate", target_minutes=120),
+        StaffMember("sam", "Brill, Sam", target_minutes=None),
+    ]
+    assert over_target(staff, classes) == [("kate", 1, 180, 120), ("kate", 2, 180, 120)]
+
+
+def test_somebody_without_a_target_cannot_be_over_it():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    classes = expand(tt, [], assign(1, "tai", [1]))
+    assert over_target([StaffMember("tai", "Edmond, Tai")], classes) == []
+
+
+def test_a_persons_semester_includes_their_cancelled_weeks():
+    tt = [row(1, "222.702", "WS-A", "Monday", "10:00", "12:00", weeks=[7, 8])]
+    exc = [ExceptionRow(1, 8, "222.702", "WS-A", Action.CANCEL)]
+    mine = classes_for(expand(tt, exc, assign(1, "tai", [7, 8])), "tai")
+    assert [c.status for c in mine] == [Status.SCHEDULED, Status.CANCELLED]
+
+
+# ------------------------------------------------------------ the safety net
+
+def test_clashes_are_still_found_if_the_data_arrives_broken():
+    """Assignments are checked on the way in, but an import can still collide."""
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2]),
+        row(2, "333.703", "LEC", "Tuesday", "15:00", "18:00", weeks=[1, 2]),
+    ]
+    classes = expand(tt, [], assign(1, "kate", [1, 2]) + assign(2, "kate", [1, 2]))
     problems = find_problems(classes)
-    assert len(problems) == 2
-
-    structural = problems[0]
-    assert structural.staff_id == "S02"
-    assert structural.weeks == tuple(range(1, 13))
-    assert structural.is_structural
-
-    one_off = problems[1]
-    assert one_off.staff_id == "S01"
-    assert one_off.weeks == (12,)
-    assert not one_off.is_structural
+    assert len(problems) == 1
+    assert problems[0].weeks == (1, 2)
+    assert problems[0].is_structural
 
 
-def test_an_added_class_can_cause_a_clash(classes):
-    """The extra crit collides with a Thursday workshop the same person runs."""
-    week12 = [c for c in find_clashes(classes) if c.week == 12 and c.staff_id == "S01"]
-    assert len(week12) == 1
-    labels = {week12[0].a.label, week12[0].b.label}
-    assert labels == {"111.701 A", "222.702 WS-C"}
+def test_the_shortened_workshop_really_is_what_avoids_the_clash():
+    """A guard: remove the exception and the clash must come back.
 
-
-# --------------------------------------------------------------- load
-
-
-def test_load_counts_teaching_minutes_per_week(classes):
-    load = load_by_staff(classes)
-    assert load["S05"][1] == 180            # workshop only
-    assert load["S05"][7] == 60 + 120       # lecture plus shortened workshop
-    assert 8 not in load["S05"]             # ANZAC Day
-
-
-def test_load_follows_a_guest_lecturer(classes):
-    load = load_by_staff(classes)
-    assert load["S08"] == {5: 180}
-    assert 5 not in load["S03"]
-
-
-# --------------------------------------------------------------- validation
-
-
-def test_clean_data_produces_no_issues(weeks, staff, timetable, exceptions):
-    assert validate(weeks, staff, timetable, exceptions) == []
-
-
-def test_the_failure_that_broke_the_spreadsheet_is_caught(weeks, staff):
-    """Two timetable rows covering the same section in the same week."""
-    overlapping = [
-        TimetableRow(1, "444.704", "Course Four", "A", "S03", "Wednesday",
-                     time(9, 0), time(12, 0), frozenset(range(1, 8))),
-        TimetableRow(2, "444.704", "Course Four", "A", "S09", "Wednesday",
-                     time(9, 0), time(12, 0), frozenset(range(7, 13))),
+    Without this the workshop test could pass because clash detection stopped
+    working rather than because the timetable is sound.
+    """
+    tt = [
+        row(1, "222.702", "LEC", "Monday", "09:00", "10:00", weeks=[7, 8, 9]),
+        row(2, "222.702", "WS-A", "Monday", "09:00", "12:00", weeks=[7, 8, 9]),
     ]
-    issues = validate(weeks, staff, overlapping, [])
-    assert any("week(s) 7" in i for i in issues)
+    assignments = assign(1, "tai", [7, 8, 9]) + assign(2, "tai", [7, 8, 9])
+    assert find_clashes(expand(tt, [], assignments))
 
-
-def test_unknown_staff_is_caught(weeks, staff, timetable):
-    broken = timetable + [
-        TimetableRow(99, "555.705", "Course Five", "A", "S99", "Friday",
-                     time(9, 0), time(12, 0), ALL_WEEKS)
+    shortened = [
+        ExceptionRow(i, w, "222.702", "WS-A", Action.CHANGE, start=t("10:00"))
+        for i, w in enumerate([7, 8, 9], start=1)
     ]
-    assert any("S99" in i for i in validate(weeks, staff, broken, []))
+    assert find_clashes(expand(tt, shortened, assignments)) == []
 
 
-def test_exception_for_a_week_the_section_does_not_run_is_caught(weeks, staff, timetable):
-    stray = [ExceptionRow(1, 3, "222.702", "LEC", Action.CANCEL)]
-    issues = validate(weeks, staff, timetable, stray)
-    assert any("does not run in week 3" in i for i in issues)
+def test_only_the_class_that_collides_is_flagged():
+    """A section appearing twice in a week: one copy clashes, the other does not."""
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[11]),
+        row(2, "444.704", "SEM", "Thursday", "14:00", "16:00", weeks=[11]),
+    ]
+    exc = [ExceptionRow(9, 11, "111.701", "A", Action.ADD, day="Thursday",
+                        start=t("13:00"), end=t("16:00"), staff_id="kate")]
+    classes = expand(tt, exc, assign(1, "kate", [11]) + assign(2, "kate", [11]))
+    clashes = find_clashes(classes)
+    assert len(clashes) == 1
+    involved = {clashes[0].a.status, clashes[0].b.status}
+    assert involved == {Status.ADDED, Status.SCHEDULED}
+    assert clashes[0].a.day == "Thursday" and clashes[0].b.day == "Thursday"
 
 
-def test_exception_for_an_unknown_section_is_caught(weeks, staff, timetable):
-    stray = [ExceptionRow(1, 3, "999.999", "Z", Action.CANCEL)]
-    issues = validate(weeks, staff, timetable, stray)
-    assert any("no timetable row" in i for i in issues)
+# ------------------------------------------------------------ validation
+
+def test_a_section_covered_by_two_rows_in_one_week_is_reported():
+    weeks = [week(n) for n in (1, 2)]
+    tt = [
+        row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2]),
+        row(2, "111.701", "A", "Thursday", "09:00", "12:00", weeks=[2]),
+    ]
+    issues = validate(weeks, [], tt, [], [])
+    assert any("more than one timetable row" in i and "week(s) 2" in i for i in issues)
 
 
-def test_incomplete_added_class_is_caught(weeks, staff, timetable):
-    thin = [ExceptionRow(1, 4, "111.701", "A", Action.ADD, staff_id="S01")]
-    issues = validate(weeks, staff, timetable, thin)
+def test_staffing_inside_an_exception_is_reported():
+    weeks = [week(1)]
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    exc = [ExceptionRow(1, 1, "111.701", "A", Action.CHANGE, staff_id="kate")]
+    issues = validate(weeks, [StaffMember("kate", "Ahern")], tt, exc, [])
+    assert any("staffing does not belong in an exception" in i for i in issues)
+
+
+def test_an_assignment_to_a_week_the_class_does_not_run_is_reported():
+    weeks = [week(n) for n in (1, 2)]
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    issues = validate(weeks, [StaffMember("kate", "Ahern")], tt, [], assign(1, "kate", [2]))
+    assert any("does not run in" in i for i in issues)
+
+
+def test_an_assignment_to_an_unknown_person_is_reported():
+    weeks = [week(1)]
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    issues = validate(weeks, [], tt, [], assign(1, "ghost", [1]))
+    assert any("not in the staff list" in i for i in issues)
+
+
+def test_an_added_class_must_say_when_it_meets():
+    weeks = [week(1)]
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    exc = [ExceptionRow(1, 1, "111.701", "A", Action.ADD, staff_id="kate")]
+    issues = validate(weeks, [StaffMember("kate", "Ahern")], tt, exc, [])
     assert any("needs day, start, end" in i for i in issues)
 
 
-def test_backwards_times_are_caught(weeks, staff):
-    backwards = [
-        TimetableRow(1, "666.706", "Course Six", "A", "S01", "Monday",
-                     time(15, 0), time(12, 0), ALL_WEEKS)
-    ]
-    assert any("before it starts" in i for i in validate(weeks, staff, backwards, []))
+def test_backwards_times_and_unknown_days_are_reported():
+    weeks = [week(1)]
+    tt = [row(1, "111.701", "A", "Funday", "17:00", "14:00", weeks=[1])]
+    issues = validate(weeks, [], tt, [], [])
+    assert any("not a day of the week" in i for i in issues)
+    assert any("ends at or before it starts" in i for i in issues)
 
 
-def test_week_outside_the_calendar_is_caught(weeks, staff):
-    too_far = [
-        TimetableRow(1, "777.707", "Course Seven", "A", "S01", "Monday",
-                     time(9, 0), time(12, 0), frozenset({1, 99}))
-    ]
-    assert any("week 99" in i for i in validate(weeks, staff, too_far, []))
-
-
-# --------------------------------------------------------------- who is free
-
-
-def test_who_is_free_reports_busy_weeks(classes, staff):
-    """Offering the Tuesday afternoon slot to everyone: who could take it?"""
-    ids = [s.id for s in staff]
-    busy = who_is_free(classes, ids, "Tuesday", time(14, 0), time(17, 0),
-                       list(range(1, 13)))
-    assert busy["S01"] == list(range(1, 13))   # already teaching then
-    assert busy["S10"] == []                   # teaching nothing at all
-    assert busy["S03"] == [w for w in range(1, 13) if w != 5]  # away in week 5
-
-
-def test_who_is_free_ignores_the_class_being_handed_over(classes, staff):
-    """S01 teaches 111.701 A on Tuesdays. Asked whether they could take that
-    very class, the answer must not be 'no, they are teaching it'."""
-    ids = [s.id for s in staff]
-    without = who_is_free(classes, ids, "Tuesday", time(14, 0), time(17, 0),
-                          list(range(1, 13)), ignoring=("111.701", "A"))
-    assert without["S01"] == []
-
-
-def test_who_is_free_ignores_other_days(classes, staff):
-    ids = [s.id for s in staff]
-    busy = who_is_free(classes, ids, "Friday", time(9, 0), time(12, 0),
-                       list(range(1, 13)))
-    assert all(weeks == [] for weeks in busy.values())
-
-
-def test_who_is_free_treats_a_cancelled_week_as_free(classes, staff):
-    """S05's Monday morning is cancelled in week 8, so they are free then."""
-    ids = [s.id for s in staff]
-    busy = who_is_free(classes, ids, "Monday", time(9, 0), time(12, 0),
-                       list(range(1, 13)))
-    assert 8 not in busy["S05"]
+def test_clean_data_has_nothing_to_report():
+    weeks = [week(n) for n in (1, 2)]
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2])]
+    staff = [StaffMember("kate", "Ahern, Kate")]
+    assert validate(weeks, staff, tt, [], assign(1, "kate", [1, 2])) == []

@@ -1,7 +1,11 @@
-"""Sample data: the two real courses used to work out how this needs to behave.
+"""Sample data, so there is something to look at on the first run.
 
-Loaded automatically the first time the app runs so there is something to look
-at. Clear it from Setup once your own data is in.
+It is shaped to show the states the tool exists to distinguish: classes fully
+staffed, a semester split between two people, a section nobody covers, a
+cancelled week, an added class, and a slot where the obvious candidate is
+already busy so the picker has somebody to grey out.
+
+Clear it from Setup once your own timetable is in.
 """
 
 from __future__ import annotations
@@ -23,84 +27,144 @@ WEEKS = [
     (12, "2026-05-25", "2026-05-31", "Last teaching week"),
 ]
 
-STAFF = [(f"S{n:02d}", f"Sample, {chr(64 + n)}", "") for n in range(1, 15)]
-
-ALL = list(range(1, 13))
-
-TIMETABLE = [
-    ("111.701", "Course One", "A", "S01", "Tuesday", "14:00", "17:00", ALL),
-    ("111.701", "Course One", "B", "S02", "Tuesday", "14:00", "17:00", ALL),
-    ("111.701", "Course One", "C", "S03", "Tuesday", "14:00", "17:00", ALL),
-    ("111.701", "Course One", "D", "S04", "Tuesday", "14:00", "17:00", ALL),
-    ("222.702", "Course Two", "LEC", "S05", "Monday", "09:00", "10:00", [7, 8, 9]),
-    ("222.702", "Course Two", "WS-A", "S05", "Monday", "09:00", "12:00", ALL),
-    ("222.702", "Course Two", "WS-B", "S06", "Monday", "09:00", "12:00", ALL),
-    ("222.702", "Course Two", "WS-C", "S01", "Thursday", "09:00", "12:00", ALL),
-    ("222.702", "Course Two", "WS-D", "S07", "Thursday", "09:00", "12:00", ALL),
-    ("333.703", "Course Three", "A", "S02", "Tuesday", "15:00", "18:00", ALL),
+# Target contact minutes per week. Not everyone has one.
+STAFF = [
+    ("ahern", "Ahern, Kate", "k.ahern@example.ac.nz", 480),
+    ("brill", "Brill, Sam", "s.brill@example.ac.nz", 480),
+    ("chen", "Chen, Wei", "w.chen@example.ac.nz", 360),
+    ("dalzell", "Dalzell, Ruth", "r.dalzell@example.ac.nz", 240),
+    ("edmond", "Edmond, Tai", "t.edmond@example.ac.nz", None),
+    ("fenwick", "Fenwick, Jo", "j.fenwick@example.ac.nz", 480),
 ]
 
+ALL = list(range(1, 13))
+FIRST_HALF = list(range(1, 7))
+SECOND_HALF = list(range(7, 13))
+
+# The external timetable. No staffing here: that is the manager's job.
+TIMETABLE = [
+    ("111.701", "Design Studio", "A", "Tuesday", "14:00", "17:00", ALL),
+    ("111.701", "Design Studio", "B", "Tuesday", "14:00", "17:00", ALL),
+    ("111.701", "Design Studio", "C", "Tuesday", "14:00", "17:00", ALL),
+    ("111.701", "Design Studio", "D", "Tuesday", "14:00", "17:00", ALL),
+    ("222.702", "Materials", "LEC", "Monday", "09:00", "10:00", [7, 8, 9]),
+    ("222.702", "Materials", "WS-A", "Monday", "10:00", "12:00", ALL),
+    ("222.702", "Materials", "WS-B", "Monday", "10:00", "12:00", ALL),
+    ("222.702", "Materials", "WS-C", "Thursday", "09:00", "12:00", ALL),
+    ("222.702", "Materials", "WS-D", "Thursday", "09:00", "12:00", ALL),
+    ("333.703", "History and Theory", "LEC", "Wednesday", "11:00", "13:00", ALL),
+    ("333.703", "History and Theory", "TUT-A", "Friday", "09:00", "10:30", ALL),
+    ("333.703", "History and Theory", "TUT-B", "Friday", "11:00", "12:30", ALL),
+    ("444.704", "Professional Practice", "SEM", "Wednesday", "14:00", "16:00", ALL),
+]
+
+# Who covers what, by (course, section) and weeks.
+#
+#   111.701 D  is deliberately left off: a section nobody covers, so the
+#              dashboard has a real gap to report.
+#   222.702 WS-C changes hands at the break, which is a split rather than a
+#              second timetable row.
+ASSIGNMENTS = [
+    ("111.701", "A", "ahern", ALL),
+    ("111.701", "B", "brill", ALL),
+    ("111.701", "C", "chen", ALL),
+    ("222.702", "LEC", "dalzell", [7, 8, 9]),
+    ("222.702", "WS-A", "edmond", ALL),
+    ("222.702", "WS-B", "fenwick", ALL),
+    ("222.702", "WS-C", "chen", FIRST_HALF),
+    ("222.702", "WS-C", "dalzell", SECOND_HALF),
+    ("222.702", "WS-D", "brill", ALL),
+    ("333.703", "LEC", "dalzell", ALL),
+    ("333.703", "TUT-A", "edmond", ALL),
+    ("333.703", "TUT-B", "edmond", ALL),
+    ("444.704", "SEM", "ahern", ALL),
+]
+
+# Departures from the timetable. None of them say who teaches.
 EXCEPTIONS = [
-    (7, "222.702", "WS-A", "Change", None, None, "10:00", None,
-     "Lecture week, workshop shortened"),
-    (7, "222.702", "WS-B", "Change", None, None, "10:00", None,
-     "Lecture week, workshop shortened"),
-    (8, "222.702", "LEC", "Cancel", None, None, None, None,
-     "ANZAC Day observed Monday 27 April"),
-    (8, "222.702", "WS-A", "Cancel", None, None, None, None,
-     "ANZAC Day observed Monday 27 April"),
-    (8, "222.702", "WS-B", "Cancel", None, None, None, None,
-     "ANZAC Day observed Monday 27 April"),
-    (9, "222.702", "WS-A", "Change", None, None, "10:00", None,
-     "Lecture week, workshop shortened"),
-    (9, "222.702", "WS-B", "Change", None, None, "10:00", None,
-     "Lecture week, workshop shortened"),
-    (5, "111.701", "C", "Change", "S08", None, None, None,
-     "Guest lecturer this week"),
-    (12, "111.701", "A", "Add", "S01", "Thursday", "09:00", "12:00",
-     "Extra crit session"),
+    {
+        "week": 8,
+        "course_code": "222.702",
+        "section": "WS-A",
+        "action": "Cancel",
+        "note": "ANZAC Day",
+    },
+    {
+        "week": 8,
+        "course_code": "222.702",
+        "section": "WS-B",
+        "action": "Cancel",
+        "note": "ANZAC Day",
+    },
+    {
+        "week": 5,
+        "course_code": "333.703",
+        "section": "LEC",
+        "action": "Change",
+        "start": "14:00",
+        "end": "16:00",
+        "note": "Moved for a visiting speaker",
+    },
+    {
+        "week": 11,
+        "course_code": "111.701",
+        "section": "A",
+        "action": "Add",
+        "day": "Thursday",
+        "start": "13:00",
+        "end": "16:00",
+        "staff_id": "ahern",
+        "note": "Extra crit before hand in",
+    },
 ]
 
 
 def load(conn) -> None:
     store.replace_weeks(
         conn,
-        [{"number": n, "starts": s, "ends": e, "note": note} for n, s, e, note in WEEKS],
+        [
+            {"number": n, "starts": s, "ends": e, "note": note}
+            for n, s, e, note in WEEKS
+        ],
     )
-    for sid, name, email in STAFF:
-        store.save_staff(conn, {"id": sid, "name": name, "email": email})
-    for code, title, section, staff, day, start, end, weeks in TIMETABLE:
-        store.save_timetable_row(
+
+    for staff_id, name, email, target in STAFF:
+        store.save_staff(
+            conn,
+            {"id": staff_id, "name": name, "email": email, "target_minutes": target},
+        )
+
+    ids: dict[tuple[str, str], int] = {}
+    for code, title, section, day, start, end, weeks in TIMETABLE:
+        ids[(code, section)] = store.save_timetable_row(
             conn,
             {
                 "course_code": code,
                 "course_title": title,
                 "section": section,
-                "staff_id": staff,
                 "day": day,
                 "start": start,
                 "end": end,
                 "weeks": weeks,
             },
         )
-    for week, code, section, action, staff, day, start, end, note in EXCEPTIONS:
-        store.save_exception(
-            conn,
-            {
-                "week": week,
-                "course_code": code,
-                "section": section,
-                "action": action,
-                "staff_id": staff,
-                "day": day,
-                "start": start,
-                "end": end,
-                "note": note,
-            },
-        )
+
+    for code, section, staff_id, weeks in ASSIGNMENTS:
+        store.set_assignment(conn, ids[(code, section)], weeks, staff_id)
+
+    for exc in EXCEPTIONS:
+        store.save_exception(conn, exc)
 
 
 def clear(conn) -> None:
     with conn:
-        for table in ("timetable_weeks", "timetable", "exceptions", "staff", "weeks"):
+        for table in (
+            "assignments",
+            "exceptions",
+            "timetable_weeks",
+            "timetable",
+            "staff",
+            "weeks",
+        ):
             conn.execute(f"DELETE FROM {table}")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('timetable', 'exceptions')")
