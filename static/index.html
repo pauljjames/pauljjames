@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en-NZ">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timetable clashes</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header>
+  <div class="masthead">
+    <h1>Timetable clashes</h1>
+    <span class="term" id="term"></span>
+    <button class="verdict" id="verdict">Loading</button>
+  </div>
+  <nav id="tabs">
+    <button data-view="staff" aria-current="true">Staff</button>
+    <button data-view="load">Load</button>
+    <button data-view="timetable">Timetable</button>
+    <button data-view="exceptions">Exceptions</button>
+    <button data-view="setup">Setup</button>
+  </nav>
+</header>
+
+<main id="main"></main>
+
+<dialog id="editor">
+  <h2 id="editor-title"></h2>
+  <div id="editor-body"></div>
+  <div class="toolbar" style="margin-top:1rem">
+    <button class="action primary" id="editor-save">Save</button>
+    <button class="action" id="editor-cancel">Cancel</button>
+    <span class="spacer"></span>
+    <button class="link danger" id="editor-delete" hidden>Delete</button>
+  </div>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
