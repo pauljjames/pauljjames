@@ -887,3 +887,77 @@ def test_a_calendar_the_tool_cannot_build_is_refused(client):
     assert client.post("/api/weeks/generate", json={
         "first_monday": "2027-07-26", "count": 12,
         "breaks": [{"starts": "2027-09-17", "ends": "2027-09-06"}]}).status_code == 400
+
+
+# ------------------------------------------------------------ handing out files
+
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def test_the_blank_template_downloads(client):
+    reply = client.get("/api/timetable/template.xlsx")
+    assert reply.status_code == 200
+    assert reply.headers["content-type"] == XLSX
+    assert 'filename="timetable-template.xlsx"' in reply.headers["content-disposition"]
+    assert reply.content[:2] == b"PK"           # a zip, which is what xlsx is
+
+
+def test_the_export_is_named_for_the_term_it_holds(client):
+    reply = client.get("/api/timetable/export.xlsx")
+    assert reply.status_code == 200
+    assert 'filename="timetable-S2FS-2027.xlsx"' in reply.headers["content-disposition"]
+
+    client.put("/api/settings", json={"academic_year": "2028", "semester": "S1FS"})
+    later = client.get("/api/timetable/export.xlsx")
+    assert 'filename="timetable-S1FS-2028.xlsx"' in later.headers["content-disposition"]
+
+
+def test_exporting_and_importing_leaves_the_timetable_where_it_was(client):
+    """The round trip through Excel, end to end."""
+    before = client.get("/api/state").json()
+    exported = client.get("/api/timetable/export.xlsx").content
+
+    preview = client.post(
+        "/api/import/preview",
+        files={"file": ("timetable.xlsx", exported, XLSX)},
+    ).json()
+    assert preview["issues"] == []
+    assert len(preview["rows"]) == len(before["timetable"])
+    assert preview["would_drop"] == []          # every class is still there
+
+    client.post("/api/import/commit", json={"rows": preview["rows"], "mode": "replace"})
+
+    after = client.get("/api/state").json()
+    assert len(after["timetable"]) == len(before["timetable"])
+    assert after["issues"] == []
+
+    # Row ids are new, since the rows are, so compare what coverage means
+    # rather than what it is keyed on.
+    def shape(state):
+        return (
+            state["coverage"]["total"], state["coverage"]["covered"],
+            sorted((r["course_code"], r["section"], tuple(r["weeks"]))
+                   for r in state["coverage"]["rows"]),
+        )
+    assert shape(after) == shape(before)                  # staffing survived
+
+
+def test_the_export_carries_who_teaches_without_letting_it_back_in(client):
+    """Staffing is readable in the file and ignored on the way back."""
+    import openpyxl, io
+    book = openpyxl.load_workbook(io.BytesIO(client.get("/api/timetable/export.xlsx").content))
+    sheet = book["Timetable"]
+    header = [c.value for c in sheet[1]]
+    assert header[:6] == list(importer.TIMETABLE_COLUMNS)
+    assert header[6:] == ["Course Name", "Assigned"]
+
+    rows = {r[0].value + " " + r[1].value: r for r in sheet.iter_rows(min_row=2)}
+    split = rows["133168 STU-A"]
+    assert split[7].value == "Chen, Wei 1-6; Dalzell, Ruth 7-12"
+    assert not rows["133150 SHOW-D"][7].value             # nobody on it
+    assert rows["133150 SHOW-A"][6].value == "Live Music Showcases"
+
+    # and the parser drops both extra columns
+    parsed, _ = importer.parse("export.xlsx", client.get("/api/timetable/export.xlsx").content)
+    assert all(set(row) == {"course_code", "section", "day", "start", "end", "weeks"}
+               for row in parsed)

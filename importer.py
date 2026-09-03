@@ -33,6 +33,11 @@ HEADERS = {
 
 REQUIRED = ("course_code", "section", "day", "start", "end", "weeks")
 
+# What this tool writes, in order. The loose spellings above stay, for files
+# that come from somewhere else; these are ours, and sheets.py builds its header
+# row from them, so a template whose columns the parser rejects is impossible.
+TIMETABLE_COLUMNS = ("Course Code", "Section", "Day", "Start", "End", "Weeks")
+
 DAY_LOOKUP = {}
 for _day in WEEKDAYS:
     DAY_LOOKUP[_day.lower()] = _day
@@ -242,6 +247,27 @@ def _time(value) -> str | None:
     if hour > 23 or minute > 59:
         return None
     return f"{hour:02d}:{minute:02d}"
+
+
+def format_weeks(weeks) -> str:
+    """The inverse of _weeks: [1,2,3,4,5,6,8] becomes "1-6, 8".
+
+    So a timetable this tool exports reads back as the same weeks it wrote.
+    """
+    ordered = sorted({int(w) for w in weeks})
+    if not ordered:
+        return ""
+
+    parts = []
+    first = last = ordered[0]
+    for week in ordered[1:]:
+        if week == last + 1:
+            last = week
+            continue
+        parts.append(str(first) if first == last else f"{first}-{last}")
+        first = last = week
+    parts.append(str(first) if first == last else f"{first}-{last}")
+    return ", ".join(parts)
 
 
 def _weeks(value) -> tuple[list[int], str | None]:

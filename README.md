@@ -200,11 +200,26 @@ sample is removed.
 
 ### A timetable
 
-Setup takes a CSV or Excel file with a header row. It needs columns for course
-code, section, day, start, end and weeks. Course names are not read from here;
-they come from the catalogue. Headers are matched loosely, so `Course Code`,
-`course code` and `Code` are all understood, as are `Activity` or `Class` for
-the section.
+The Planner does this, beside the classes it is about. Three things sit in its
+header:
+
+- **Blank template** downloads a spreadsheet with the right columns and an
+  Example sheet showing the week syntax. The header row is generated from the
+  same list the parser reads, so a template with columns the tool will not
+  accept is not possible.
+- **Export** downloads this term's timetable, named for the term, ready to edit
+  in Excel and import again.
+- **Import…** reads one back.
+
+The file needs a header row with columns for course code, section, day, start,
+end and weeks. Headers are matched loosely, so `Course Code`, `course code` and
+`Code` are all understood, as are `Activity` or `Class` for the section.
+
+An export carries two more columns, **Course Name** and **Assigned**, greyed in
+the header because they are there to be read. The parser ignores both. A course
+is named by the catalogue so it is named in one place, and staffing is decided
+on the Planner where every assignment is checked against everything else that
+person teaches. A spreadsheet is not a second way in past that check.
 
 Weeks are written the way people write them: `1-12`, `1-6, 8`, `1-3 and 5`,
 `Weeks 7-9`. Times take `9:00`, `09:00`, `9.30`, `0900`, `1pm`, and whatever a
@@ -251,8 +266,9 @@ name rather than silently absorbed.
 
 ```
 engine.py     the rules: expansion, staffing, conflicts, coverage, load,
-              the usual week, validation
+              the usual week, the calendar, validation
 importer.py   reading a timetable and a course catalogue out of spreadsheets
+sheets.py     writing the template and the export back out
 store.py      SQLite, and nothing else
 app.py        HTTP, and nothing else
 seed.py       sample data
@@ -281,7 +297,7 @@ from the class it sits beside rather than the same thing counted twice.
 python -m pytest
 ```
 
-187 tests. The engine cases came from two real course outlines: a lecture
+197 tests. The engine cases came from two real course outlines: a lecture
 running in three weeks only, workshops shortened in those weeks so the lecturer
 is not double booked, a public holiday cancellation, a one week substitution,
 split semester teaching, and an added crit session.
@@ -299,7 +315,13 @@ which must not fold into it.
 
 The catalogue is tested for what a real export does: numeric codes, a course
 name with a comma in it, one code in two semesters, and the four coordinator
-columns staying apart. One test asserts the thing the catalogue rests on: no
+columns staying apart.
+
+The spreadsheets are tested in both directions at once: every column the tool
+writes is one its parser accepts, the blank template reads as an empty
+timetable, and a timetable exported and imported again comes back as the same
+classes with the same staffing, with the two read-only columns dropped on the
+way in. One test asserts the thing the catalogue rests on: no
 coordinator is ever a staff member, and who teaches a course comes from
 assignments alone.
 

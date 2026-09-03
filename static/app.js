@@ -3,7 +3,7 @@
 // Kept in step with VERSION in app.py. The browser reads this file fresh on
 // every load but the routes live in the running server, so a new front end can
 // meet an old one. This is what lets the page say so.
-const APP_VERSION = "2026-09-04.2";
+const APP_VERSION = "2026-09-05.1";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
               "Saturday", "Sunday"];
@@ -573,6 +573,24 @@ function plannerView() {
       el("button", {
         class: "action", text: "Add a class",
         onclick: () => editTimetable(null),
+      }),
+      el("button", {
+        class: showImport ? "action primary" : "action",
+        text: showImport ? "Close" : "Import…",
+        onclick: () => {
+          showImport = !showImport;
+          if (!showImport) importPreview = null;
+          render();
+        },
+      }),
+      el("button", {
+        class: "action", text: "Export",
+        title: "This term's timetable as a spreadsheet",
+        onclick: () => download("/api/timetable/export.xlsx"),
+      }),
+      el("button", {
+        class: "link", text: "Blank template",
+        onclick: () => download("/api/timetable/template.xlsx"),
       })));
 
   panel.append(el("p", { class: "hint" },
@@ -589,6 +607,8 @@ function plannerView() {
       class: gapsOnly ? "pill on" : "pill", text: "Needs somebody",
       onclick: () => { gapsOnly = !gapsOnly; render(); },
     })));
+
+  if (showImport || importPreview) panel.append(importPanel());
 
   const bulk = el("div");
   const holder = el("div");
@@ -1682,9 +1702,19 @@ function setupView() {
   wrap.append(staffPanel);
 
   wrap.append(offeringPanel());
-  wrap.append(importPanel());
 
   wrap.append(calendarPanel());
+
+  wrap.append(el("section", { class: "panel" },
+    el("h2", { text: "The timetable" }),
+    el("p", { class: "hint" },
+      "Importing a timetable, exporting it, and the blank template all live on ",
+      "the Planner now, beside the classes they are about."),
+    el("div", { class: "toolbar" },
+      el("button", {
+        class: "action", text: "Go to the Planner",
+        onclick: () => go("planner"),
+      }))));
 
   // data
   wrap.append(el("section", { class: "panel" },
@@ -1787,10 +1817,11 @@ function offeringPanel() {
 // ------------------------------------------------------------ import
 
 let importPreview = null;
+let showImport = false;
 
 function importPanel() {
-  const panel = el("section", { class: "panel" },
-    el("h2", { text: "Import a timetable" }));
+  const panel = el("section", { class: "inset" },
+    el("h3", { text: "Import a timetable" }));
 
   panel.append(el("p", { class: "hint" },
     "A CSV or Excel file with a header row and columns for course code, section, ",
@@ -1864,6 +1895,14 @@ function importPanel() {
   return panel;
 }
 
+/** Ask the browser to save what an endpoint returns. */
+function download(path) {
+  const link = el("a", { href: path, download: "" });
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
 async function previewImport(file) {
   if (!file) return;
   const form = new FormData();
@@ -1891,6 +1930,7 @@ async function commitImport(mode) {
     const result = await api("POST", "/api/import/commit",
       { rows: importPreview.rows, mode });
     importPreview = null;
+    showImport = false;
     $("#importfile") && ($("#importfile").value = "");
     toast(result.kept
       ? `Imported ${result.added} classes, keeping ${result.kept} staffed weeks.`
@@ -2394,6 +2434,7 @@ function go(view) {
     candidates = null;
     coursePreview = null;
     importPreview = null;
+    showImport = false;
     wizard = null;
     selected.clear();
     plannerQuery = "";

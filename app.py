@@ -22,13 +22,14 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import engine
 import importer
 import seed
+import sheets
 import store
 
 HERE = Path(__file__).parent
@@ -37,7 +38,7 @@ HERE = Path(__file__).parent
 # every load, but the routes live in this process, so an unrestarted server
 # serves a new front end against old endpoints. The front end compares this
 # against its own copy and says so rather than failing with a bare 404.
-VERSION = "2026-09-04.2"
+VERSION = "2026-09-05.1"
 
 
 def active_term(conn) -> tuple[str, str]:
@@ -560,6 +561,64 @@ def import_commit(body: CommitIn) -> dict:
         result = store.replace_timetable(conn, body.rows, term=active_term(conn))
 
     return {"ok": True, "added": len(body.rows), **result}
+
+
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def spreadsheet(data: bytes, filename: str) -> Response:
+    return Response(
+        content=data,
+        media_type=XLSX,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def term_slug(term: tuple[str, str]) -> str:
+    return "-".join(part for part in (term[1], term[0]) if part)
+
+
+@app.get("/api/timetable/template.xlsx")
+def timetable_template() -> Response:
+    """A blank timetable to fill in, with the columns the importer reads."""
+    return spreadsheet(sheets.timetable_template(), "timetable-template.xlsx")
+
+
+@app.get("/api/timetable/export.xlsx")
+def timetable_export() -> Response:
+    """This term's timetable, editable in Excel and importable again.
+
+    It carries the course name and who is teaching as well, for reading. Both
+    are ignored on the way back in: a course is named by the catalogue, and
+    staffing is decided on the Planner where it is checked.
+    """
+    with db() as conn:
+        term = active_term(conn)
+        _, staff, timetable, _, assignments, courses = store.load_all(conn, term)
+
+    names = engine.course_names(courses)
+    who = {person.id: person.name for person in staff}
+    spans = engine.group_assignments(assignments)
+
+    data = sheets.timetable_export([
+        {
+            "course_code": row.course_code,
+            "section": row.section,
+            "day": row.day,
+            "start": store.from_time(row.start),
+            "end": store.from_time(row.end),
+            "weeks": sorted(row.weeks),
+            "course_name": names.get(row.course_code, ""),
+            "assigned": [
+                {"name": who.get(staff_id, staff_id), "weeks": list(weeks)}
+                for staff_id, weeks in spans.get(row.id, [])
+            ],
+        }
+        for row in timetable
+    ])
+
+    slug = term_slug(term)
+    return spreadsheet(data, f"timetable-{slug}.xlsx" if slug else "timetable.xlsx")
 
 
 @app.post("/api/courses/import/preview")

@@ -343,3 +343,60 @@ def test_courses_come_back_in_a_predictable_order():
     assert [(r["code"], r["semester"]) for r in rows] == [
         ("133150", "S1FS"), ("133150", "S2FS"), ("133175", "S1FS"),
     ]
+
+
+# ------------------------------------------------------------ writing them back
+
+def test_format_weeks_is_the_parser_run_backwards():
+    for weeks in ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [1, 2, 3, 4, 5, 6, 8],
+                  [3], [7, 8, 9], [1, 2, 4, 5, 7], [2, 4, 6, 8, 10]):
+        text = importer.format_weeks(weeks)
+        back, problem = importer._weeks(text)
+        assert problem is None, text
+        assert back == weeks, f"{weeks} wrote {text!r} and read back {back}"
+
+
+def test_no_weeks_writes_nothing():
+    assert importer.format_weeks([]) == ""
+
+
+def test_format_weeks_tidies_what_it_is_given():
+    assert importer.format_weeks([5, 1, 3, 2, 1]) == "1-3, 5"
+
+
+def test_every_column_this_tool_writes_is_one_it_can_read():
+    """The drift that would make a template worse than no template."""
+    found, issues = importer._map_headers(list(importer.TIMETABLE_COLUMNS))
+    assert issues == []
+    assert set(found) == set(importer.REQUIRED)
+
+
+def test_the_blank_template_reads_as_an_empty_timetable():
+    import sheets
+    rows, issues = importer.parse("template.xlsx", sheets.timetable_template())
+    assert rows == []
+    assert issues == []
+
+
+def test_an_export_reads_back_as_what_was_exported():
+    """The round trip, including the two columns the parser must ignore."""
+    import sheets
+    original = [
+        {"course_code": "133150", "section": "SHOW-A", "day": "Tuesday",
+         "start": "14:00", "end": "17:00", "weeks": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+         "course_name": "Live Music Showcases",
+         "assigned": [{"name": "Chen, Wei", "weeks": [1, 2, 3, 4, 5, 6]},
+                      {"name": "Dalzell, Ruth", "weeks": [7, 8, 9, 10, 11, 12]}]},
+        {"course_code": "133154", "section": "LEC", "day": "Monday",
+         "start": "09:00", "end": "10:00", "weeks": [7, 8, 9],
+         "course_name": "Music, People, Places", "assigned": []},
+    ]
+    rows, issues = importer.parse("export.xlsx", sheets.timetable_export(original))
+
+    assert issues == []
+    assert rows == [
+        {"course_code": "133150", "section": "SHOW-A", "day": "Tuesday",
+         "start": "14:00", "end": "17:00", "weeks": list(range(1, 13))},
+        {"course_code": "133154", "section": "LEC", "day": "Monday",
+         "start": "09:00", "end": "10:00", "weeks": [7, 8, 9]},
+    ]
