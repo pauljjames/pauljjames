@@ -107,6 +107,15 @@ week spike is flagged beside it instead, because those are different problems.
 which weeks as named spans over a ribbon of the semester, so a gap is visible
 without reading anything. Each person keeps the same colour throughout.
 
+Search narrows the list by course, section or day, and *Needs somebody* narrows
+it to the gaps. Tick rows to act on several at once: assign them all to one
+person, take everybody off them, or delete them. The header tick takes only what
+the filter is currently showing, and a selection survives changing the filter.
+
+Bulk assignment is checked the same way single assignment is, one class at a
+time, so it cannot make a double booking. It reports how many took and names the
+classes the person was already busy for.
+
 *Assign* opens underneath the row. Choose the weeks first, then the person.
 Everyone who could take it comes first with their current hours against their
 target; everyone who could not is greyed out and says which weeks they are
@@ -210,6 +219,18 @@ for one section is what makes duplicate classes and false clashes.
 On import, staffing is re-attached wherever the same course, section and week
 still exist. What no longer has a class under it is listed rather than dropped
 quietly.
+
+## Deleting
+
+Delete is one click on the bin, with no dialog, and the toast offers to put it
+back for a few seconds. Two clicks were never safety; they were friction. The
+undo is what makes it safe, and it is what makes deleting a whole selection at
+once reasonable to offer.
+
+Putting something back restores what went with it. Deleting a class takes its
+staffing, and deleting a person takes theirs, so both are captured before the
+delete and replayed after. If a slot was taken in the meantime the rest still
+comes back and the part that could not is named rather than dropped quietly.
 
 ## Data problems
 

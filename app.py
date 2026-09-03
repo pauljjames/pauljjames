@@ -37,7 +37,7 @@ HERE = Path(__file__).parent
 # every load, but the routes live in this process, so an unrestarted server
 # serves a new front end against old endpoints. The front end compares this
 # against its own copy and says so rather than failing with a bare 404.
-VERSION = "2026-09-04.1"
+VERSION = "2026-09-04.2"
 
 
 def active_term(conn) -> tuple[str, str]:

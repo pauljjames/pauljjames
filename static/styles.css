@@ -184,6 +184,58 @@ main { padding: 1.1rem; max-width: 1180px; margin: 0 auto; }
 .link:hover { text-decoration: underline; }
 .link.danger { color: var(--clash); }
 
+.action.danger { color: var(--clash); border-color: #e6c3c3; }
+.action.danger:hover { background: var(--clash-wash); border-color: var(--clash); }
+
+/* Icon buttons. The glyph is decorative; the button carries the label. */
+.iconbtn {
+  border: 1px solid transparent;
+  background: none;
+  border-radius: 5px;
+  padding: 0.2rem;
+  margin-left: 0.15rem;
+  cursor: pointer;
+  color: var(--ink-soft);
+  line-height: 0;
+  vertical-align: middle;
+}
+.iconbtn:hover { background: var(--paper); border-color: var(--rule); color: var(--ink); }
+.iconbtn.danger:hover {
+  background: var(--clash-wash); border-color: #e6c3c3; color: var(--clash);
+}
+
+.nowrap { white-space: nowrap; }
+
+/* Selection */
+td.tick, th.tick { width: 1.6rem; padding-right: 0; }
+td.tick input, th.tick input { margin: 0; cursor: pointer; }
+tr.chosen td { background: #eef3fb; }
+tr.chosen.clash td { background: var(--clash-wash); }
+
+.bulkbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  background: var(--ink);
+  color: #fff;
+  border-radius: 6px;
+  padding: 0.45rem 0.7rem;
+  margin: 0.6rem 0 0.2rem;
+  position: sticky;
+  top: 4.6rem;
+  z-index: 5;
+}
+.bulkbar .action {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.28);
+  color: #fff;
+}
+.bulkbar .action:hover { background: rgba(255, 255, 255, 0.22); }
+.bulkbar .action.danger { color: #ffd7d7; border-color: rgba(255, 190, 190, 0.5); }
+.bulkbar .action.danger:hover { background: rgba(255, 120, 120, 0.28); }
+.bulkbar .link { color: #cdd6e4; }
+
 /* ------------------------------------------------------------ marks */
 
 .dot {
@@ -574,20 +626,42 @@ select { font: inherit; }
 
 /* ------------------------------------------------------------ toast */
 
-.toast {
+#toasts {
   position: fixed;
   left: 50%;
   bottom: 1.3rem;
   transform: translateX(-50%);
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: center;
+  gap: 0.4rem;
+  z-index: 50;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
   background: var(--ink);
   color: #fff;
   padding: 0.5rem 1rem;
   border-radius: 6px;
   font-size: 0.87rem;
   box-shadow: 0 6px 20px rgba(20, 30, 50, 0.25);
-  z-index: 50;
-  max-width: min(44rem, calc(100% - 2rem));
+  max-width: min(44rem, 90vw);
 }
 .toast.bad { background: var(--clash); }
+
+.toast-undo {
+  margin-left: 0.9rem;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  background: none;
+  color: #fff;
+  font: inherit;
+  font-weight: 620;
+  border-radius: 5px;
+  padding: 0.1rem 0.6rem;
+  cursor: pointer;
+}
+.toast-undo:hover { background: rgba(255, 255, 255, 0.16); }
 
 .cand-why .over { color: var(--clash); font-weight: 620; }

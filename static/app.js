@@ -3,7 +3,7 @@
 // Kept in step with VERSION in app.py. The browser reads this file fresh on
 // every load but the routes live in the running server, so a new front end can
 // meet an old one. This is what lets the page say so.
-const APP_VERSION = "2026-09-04.1";
+const APP_VERSION = "2026-09-04.2";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
               "Saturday", "Sunday"];
@@ -45,10 +45,71 @@ function el(tag, attrs = {}, ...kids) {
   return node;
 }
 
+// Stroke drawings on currentColor, so they take the colour of the button they
+// sit in and scale with it. The glyph is hidden from assistive tech; the button
+// around it carries the label.
+const ICONS = {
+  edit: '<path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17v3Z"/><path d="M14.5 6.5l3 3"/>',
+  remove: '<path d="M4 7h16"/><path d="M9 7V4h6v3"/>'
+        + '<path d="M18 7l-1 13H7L6 7"/><path d="M10 11v6M14 11v6"/>',
+};
+
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  for (const [key, value] of Object.entries({
+    viewBox: "0 0 24 24", width: "16", height: "16", fill: "none",
+    stroke: "currentColor", "stroke-width": "1.7",
+    "stroke-linecap": "round", "stroke-linejoin": "round",
+    "aria-hidden": "true", focusable: "false",
+  })) svg.setAttribute(key, value);
+  svg.innerHTML = ICONS[name] || "";
+  return svg;
+}
+
+function iconButton(name, label, onclick, tone = "") {
+  return el("button", {
+    class: `iconbtn ${tone}`, "aria-label": label, title: label, onclick,
+  }, icon(name));
+}
+
+// Toasts stack rather than landing on top of one another: a bulk action can
+// finish while an earlier undo is still offered.
+function toastHolder() {
+  let holder = $("#toasts");
+  if (!holder) {
+    holder = el("div", { id: "toasts" });
+    document.body.append(holder);
+  }
+  return holder;
+}
+
 function toast(message, isError = false) {
   const note = el("div", { class: `toast ${isError ? "bad" : ""}`, text: message });
-  document.body.append(note);
+  toastHolder().append(note);
   setTimeout(() => note.remove(), isError ? 6000 : 3000);
+}
+
+/** A toast that offers to put back what was just removed. */
+function undoToast(message, undo) {
+  const note = el("div", { class: "toast" }, el("span", { text: message }));
+  let closed = false;
+  const close = () => { if (!closed) { closed = true; note.remove(); } };
+
+  note.append(el("button", {
+    class: "toast-undo", text: "Undo",
+    onclick: async () => {
+      close();
+      try {
+        await undo();
+        await refresh();
+      } catch (error) {
+        toast(error.message, true);
+      }
+    },
+  }));
+
+  toastHolder().append(note);
+  setTimeout(close, 9000);
 }
 
 async function api(method, path, body) {
@@ -74,6 +135,11 @@ async function api(method, path, body) {
   }
   return payload;
 }
+
+const courseName = (code) => {
+  const course = state.courses.find((c) => c.code === code);
+  return course ? course.name : "";
+};
 
 const staffName = (id) => {
   if (!id) return "Nobody";
@@ -134,6 +200,8 @@ async function refresh() {
   const before = state && state.settings;
   state = await api("GET", "/api/state");
   if (before && !sameTerm(before, state.settings)) wizard = null;
+  const alive = new Set(state.timetable.map((r) => r.id));
+  for (const id of [...selected]) if (!alive.has(id)) selected.delete(id);
   assignColours();
   renderChrome();
   render();
@@ -342,9 +410,151 @@ function utilisationPanel() {
   }
 }
 
+// ------------------------------------------------------------ removing things
+
+// Deleting a class takes its staffing with it, and deleting a person takes
+// theirs. So anything that can be undone is captured before it goes, and put
+// back afterwards; the state already holds both halves.
+
+const spansOf = (rowId) =>
+  state.assignments
+    .filter((a) => a.timetable_id === rowId)
+    .map((a) => ({ staff_id: a.staff_id, weeks: [...a.weeks] }));
+
+async function replaceSpans(timetableId, spans) {
+  const lost = [];
+  for (const span of spans) {
+    try {
+      await api("POST", "/api/assign", {
+        timetable_id: timetableId, staff_id: span.staff_id,
+        weeks: span.weeks, replace: true,
+      });
+    } catch {
+      lost.push(staffName(span.staff_id));
+    }
+  }
+  return lost;
+}
+
+async function removeTimetableRows(rows) {
+  const kept = rows.map((row) => ({ row, spans: spansOf(row.id) }));
+
+  try {
+    for (const { row } of kept) await api("DELETE", `/api/timetable/${row.id}`);
+  } catch (error) {
+    toast(error.message, true);
+    return;
+  }
+
+  selected.clear();
+  openRow = null;
+  await refresh();
+
+  const what = kept.length === 1
+    ? `${kept[0].row.course_code} ${kept[0].row.section} deleted.`
+    : `${kept.length} classes deleted.`;
+
+  undoToast(what, async () => {
+    const lost = [];
+    for (const { row, spans } of kept) {
+      const made = await api("POST", "/api/timetable", {
+        course_code: row.course_code, section: row.section, day: row.day,
+        start: row.start, end: row.end, weeks: row.weeks,
+      });
+      lost.push(...await replaceSpans(made.id, spans));
+    }
+    toast(lost.length
+      ? `Put back, but ${lost.join(" and ")} could not take it again.`
+      : "Put back.", lost.length > 0);
+  });
+}
+
+async function unassignRows(rows) {
+  const kept = rows
+    .map((row) => ({ row, spans: spansOf(row.id) }))
+    .filter((k) => k.spans.length);
+
+  if (!kept.length) {
+    toast("Nobody is on those to take off.");
+    return;
+  }
+
+  try {
+    for (const { row } of kept) await api("POST", "/api/unassign", { timetable_id: row.id });
+  } catch (error) {
+    toast(error.message, true);
+    return;
+  }
+
+  selected.clear();
+  await refresh();
+  undoToast(
+    kept.length === 1
+      ? `${kept[0].row.course_code} ${kept[0].row.section} has nobody on it.`
+      : `${kept.length} classes cleared.`,
+    async () => {
+      for (const { row, spans } of kept) await replaceSpans(row.id, spans);
+      toast("Staffing put back.");
+    });
+}
+
+async function removeException(exc) {
+  try {
+    await api("DELETE", `/api/exceptions/${exc.id}`);
+  } catch (error) {
+    toast(error.message, true);
+    return;
+  }
+  await refresh();
+  undoToast(`${exc.action} for ${exc.course_code} ${exc.section} in week ${exc.week} deleted.`,
+    async () => {
+      const { id, ...body } = exc;
+      await api("POST", "/api/exceptions", body);
+      toast("Put back.");
+    });
+}
+
+async function removeStaff(person) {
+  // Their assignments go with them, so those come back too.
+  const spans = state.assignments
+    .filter((a) => a.staff_id === person.id)
+    .map((a) => ({ timetable_id: a.timetable_id, weeks: [...a.weeks] }));
+
+  try {
+    await api("DELETE", `/api/staff/${person.id}`);
+  } catch (error) {
+    toast(error.message, true);
+    return;
+  }
+  await refresh();
+
+  undoToast(`${person.name} removed.`, async () => {
+    await api("POST", "/api/staff", {
+      id: person.id, name: person.name, email: person.email,
+      target_minutes: person.target_minutes,
+    });
+    const lost = [];
+    for (const span of spans) {
+      try {
+        await api("POST", "/api/assign", {
+          timetable_id: span.timetable_id, staff_id: person.id,
+          weeks: span.weeks, replace: true,
+        });
+      } catch { lost.push(span.timetable_id); }
+    }
+    toast(lost.length
+      ? `${person.name} is back, but not on ${lost.length} of their classes.`
+      : `${person.name} is back.`, lost.length > 0);
+  });
+}
+
 // ------------------------------------------------------------ planner
 
 let openRow = null;      // the timetable row whose assign panel is showing
+
+let selected = new Set();
+let plannerQuery = "";
+let gapsOnly = false;
 
 function plannerView() {
   const wrap = el("div", {}, staleServerBanner(), issuesPanel(), clashPanel());
@@ -369,53 +579,172 @@ function plannerView() {
     "The timetable is set outside this tool. What you decide is who covers it, ",
     "week by week. Nobody can be put in two places at once."));
 
-  const table = el("table", { class: "planner" },
-    el("thead", {}, el("tr", {},
-      el("th", { text: "Class" }),
-      el("th", { text: "When" }),
-      el("th", { text: "Staffing" }),
-      el("th", {}))));
+  panel.append(el("div", { class: "toolbar" },
+    el("input", {
+      type: "search", class: "search", value: plannerQuery,
+      placeholder: "Find a course, section or day",
+      oninput: (e) => { plannerQuery = e.target.value; draw(); },
+    }),
+    el("button", {
+      class: gapsOnly ? "pill on" : "pill", text: "Needs somebody",
+      onclick: () => { gapsOnly = !gapsOnly; render(); },
+    })));
 
-  const body = el("tbody");
-  for (const row of state.timetable) {
-    body.append(plannerRow(row));
-    if (openRow === row.id) body.append(assignRow(row));
-  }
-  table.append(body);
-  panel.append(table);
+  const bulk = el("div");
+  const holder = el("div");
+  panel.append(bulk, holder);
   wrap.append(panel);
+
+  function matching() {
+    const needle = plannerQuery.trim().toLowerCase();
+    const short = new Set(
+      state.coverage.rows.map((r) => r.timetable_row_id).filter(Boolean));
+    return state.timetable.filter((row) => {
+      if (gapsOnly && !short.has(row.id)) return false;
+      if (!needle) return true;
+      return [row.course_code, row.section, row.day, courseName(row.course_code)]
+        .some((value) => (value || "").toLowerCase().includes(needle));
+    });
+  }
+
+  // Only the table is redrawn as you type, so the caret stays where it is.
+  function draw() {
+    const rows = matching();
+    const shown = new Set(rows.map((r) => r.id));
+    const allShownChosen = rows.length > 0 && rows.every((r) => selected.has(r.id));
+
+    bulk.replaceChildren(selected.size ? bulkBar() : el("div"));
+
+    const head = el("input", {
+      type: "checkbox", checked: allShownChosen,
+      "aria-label": "Select everything shown",
+      onchange: () => {
+        if (allShownChosen) for (const id of shown) selected.delete(id);
+        else for (const id of shown) selected.add(id);
+        draw();
+      },
+    });
+
+    const table = el("table", { class: "planner" },
+      el("thead", {}, el("tr", {},
+        el("th", { class: "tick" }, head),
+        el("th", { text: "Class" }),
+        el("th", { text: "When" }),
+        el("th", { text: "Staffing" }),
+        el("th", {}))));
+
+    const body = el("tbody");
+    for (const row of rows) {
+      body.append(plannerRow(row, draw));
+      if (openRow === row.id) body.append(assignRow(row));
+    }
+    table.append(body);
+
+    holder.replaceChildren(table, el("p", { class: "muted", style: "padding-top:0.5rem" },
+      rows.length === state.timetable.length
+        ? `${rows.length} classes.`
+        : `${rows.length} of ${state.timetable.length} classes.`));
+  }
+
+  function bulkBar() {
+    const chosen = state.timetable.filter((r) => selected.has(r.id));
+    return el("div", { class: "bulkbar" },
+      el("strong", { text: `${chosen.length} selected` }),
+      el("span", { class: "spacer" }),
+      el("button", {
+        class: "action", text: "Assign to…", onclick: () => assignManyTo(chosen),
+      }),
+      el("button", {
+        class: "action", text: "Take nobody", onclick: () => unassignRows(chosen),
+      }),
+      el("button", {
+        class: "action danger", text: "Delete",
+        onclick: () => removeTimetableRows(chosen),
+      }),
+      el("button", {
+        class: "link", text: "Clear",
+        onclick: () => { selected.clear(); draw(); },
+      }));
+  }
+
+  draw();
   return wrap;
+}
+
+/** One person onto every selected class, each still clash checked. */
+function assignManyTo(rows) {
+  if (!state.staff.length) {
+    toast("There is nobody to assign.", true);
+    return;
+  }
+  openEditor(`Assign ${rows.length} ${rows.length === 1 ? "class" : "classes"}`, [
+    field("To", staffSelect("bulk-staff", state.staff[0].id)),
+    el("p", { class: "hint" },
+      "Each class is assigned for every week it runs, taking it off whoever ",
+      "holds it now. Anyone already teaching at that time is refused, one class ",
+      "at a time, so this cannot make a double booking."),
+  ], async () => {
+    const staffId = val("bulk-staff");
+    const refused = [];
+    let took = 0;
+
+    for (const row of rows) {
+      try {
+        await api("POST", "/api/assign", {
+          timetable_id: row.id, staff_id: staffId, replace: true,
+        });
+        took += 1;
+      } catch {
+        refused.push(`${row.course_code} ${row.section}`);
+      }
+    }
+
+    selected.clear();
+    toast(refused.length
+      ? `${took} assigned. Busy for ${refused.join(", ")}.`
+      : `${took} assigned to ${staffName(staffId)}.`, refused.length > 0);
+  }, { done: null });
 }
 
 function spansFor(rowId) {
   return state.assignments.filter((a) => a.timetable_id === rowId);
 }
 
-function plannerRow(row) {
+function plannerRow(row, redraw) {
   const spans = spansFor(row.id);
   const staffed = new Set(spans.flatMap((s) => s.weeks));
   const gaps = row.weeks.filter((w) => !staffed.has(w) && !isCancelled(row, w));
   const clashing = state.classes.some(
     (c) => c.timetable_row_id === row.id && c.clashing);
+  const title = courseName(row.course_code);
 
-  return el("tr", { class: clashing ? "clash" : "" },
+  return el("tr", { class: `${clashing ? "clash" : ""} ${selected.has(row.id) ? "chosen" : ""}` },
+    el("td", { class: "tick" }, el("input", {
+      type: "checkbox", checked: selected.has(row.id),
+      "aria-label": `Select ${row.course_code} ${row.section}`,
+      onchange: (e) => {
+        if (e.target.checked) selected.add(row.id); else selected.delete(row.id);
+        redraw();
+      },
+    })),
     el("td", {},
       el("strong", { text: `${row.course_code} ${row.section}` }),
-      row.course_title ? el("div", { class: "muted", text: row.course_title }) : null),
+      title ? el("div", { class: "muted", text: title }) : null),
     el("td", {},
       dayDot(row.day),
       `${row.day} ${row.start}–${row.end}`,
       el("div", { class: "muted", text: `weeks ${weekRanges(row.weeks)}` })),
     el("td", {}, staffingCell(row, spans, gaps)),
-    el("td", { class: "right" },
+    el("td", { class: "right nowrap" },
       el("button", {
         class: openRow === row.id ? "action primary" : "action",
         text: openRow === row.id ? "Close" : "Assign",
         onclick: () => { openRow = openRow === row.id ? null : row.id; render(); },
       }),
-      el("button", {
-        class: "link", text: "Edit", onclick: () => editTimetable(row),
-      })));
+      iconButton("edit", `Edit ${row.course_code} ${row.section}`,
+        () => editTimetable(row)),
+      iconButton("remove", `Delete ${row.course_code} ${row.section}`,
+        () => removeTimetableRows([row]), "danger")));
 }
 
 function isCancelled(row, week) {
@@ -482,7 +811,7 @@ function openAssign(rowId) {
 }
 
 function assignRow(row) {
-  const cell = el("td", { colspan: 4 });
+  const cell = el("td", { colspan: 5 });
   cell.append(assignPanel(row));
   return el("tr", { class: "assign-row" }, cell);
 }
@@ -1027,8 +1356,11 @@ function exceptionsView() {
         el("span", { class: `badge ${exc.action.toLowerCase()}`, text: exc.action }),
         " ", describeOverride(exc)),
       el("td", { class: "muted", text: exc.note || "" }),
-      el("td", { class: "right" },
-        el("button", { class: "link", text: "Edit", onclick: () => editException(exc) }))));
+      el("td", { class: "right nowrap" },
+        iconButton("edit", `Edit the ${exc.action.toLowerCase()} for ${exc.course_code} ${exc.section}`,
+          () => editException(exc)),
+        iconButton("remove", `Delete the ${exc.action.toLowerCase()} for ${exc.course_code} ${exc.section}`,
+          () => removeException(exc), "danger"))));
   }
   table.append(body);
   panel.append(table);
@@ -1337,8 +1669,10 @@ function setupView() {
         el("td", { class: "muted", text: person.id }),
         el("td", { class: "muted", text: person.email || "" }),
         el("td", { class: "num muted", text: person.target_minutes ? `${hours(person.target_minutes)} h` : "—" }),
-        el("td", { class: "right" },
-          el("button", { class: "link", text: "Edit", onclick: () => editStaff(person) }))));
+        el("td", { class: "right nowrap" },
+          iconButton("edit", `Edit ${person.name}`, () => editStaff(person)),
+          iconButton("remove", `Remove ${person.name}`,
+            () => removeStaff(person), "danger"))));
     }
     table.append(body);
     staffPanel.append(table);
@@ -1797,23 +2131,11 @@ function confirmDialog(title, question) {
   });
 }
 
-function openEditor(title, fields, onSave, onDelete) {
+function openEditor(title, fields, onSave, { done = "Saved." } = {}) {
   const dialog = $("#editor");
   $("#editor-title").textContent = title;
   $("#editor-body").replaceChildren(...fields);
-
-  const remove = $("#editor-delete");
-  remove.hidden = !onDelete;
-  remove.onclick = async () => {
-    if (!(await confirmDialog("Delete this?", "This cannot be undone."))) return;
-    try {
-      await onDelete();
-      dialog.close();
-      openRow = null;
-      await refresh();
-      toast("Deleted.");
-    } catch (error) { toast(error.message, true); }
-  };
+  $("#editor-delete").hidden = true;
 
   $("#editor-save").textContent = "Save";
   $("#editor-save").onclick = async () => {
@@ -1821,7 +2143,7 @@ function openEditor(title, fields, onSave, onDelete) {
       await onSave();
       dialog.close();
       await refresh();
-      toast("Saved.");
+      if (done) toast(done);
     } catch (error) { toast(error.message, true); }
   };
   $("#editor-cancel").onclick = () => dialog.close();
@@ -1833,20 +2155,36 @@ function field(label, input) {
   return el("label", { class: "field" }, el("span", { text: label }), input);
 }
 
-function courseInput(id, value) {
+/** Typeable, but suggests what already exists. */
+function listInput(id, value, options, placeholder = "") {
   const listId = `${id}-list`;
   const input = el("input", {
-    id, value: value ?? "", type: "text", list: listId,
-    placeholder: state.courses.length ? state.courses[0].code : "133150",
+    id, value: value ?? "", type: "text", list: listId, placeholder,
   });
   const list = el("datalist", { id: listId });
+  for (const option of options) {
+    list.append(typeof option === "string"
+      ? el("option", { value: option })
+      : el("option", { value: option.value }, option.label || ""));
+  }
+  return el("span", { class: "picker" }, input, list);
+}
+
+function courseInput(id, value) {
   const seen = new Set();
+  const options = [];
   for (const course of state.courses) {
     if (seen.has(course.code)) continue;
     seen.add(course.code);
-    list.append(el("option", { value: course.code }, course.name));
+    options.push({ value: course.code, label: course.name });
   }
-  return el("span", { class: "picker" }, input, list);
+  return listInput(id, value, options,
+    state.courses.length ? state.courses[0].code : "133150");
+}
+
+function sectionInput(id, value) {
+  const sections = [...new Set(state.timetable.map((r) => r.section))].sort();
+  return listInput(id, value, sections, sections[0] || "LEC");
 }
 
 
@@ -1950,7 +2288,7 @@ function editTimetable(row) {
         ? api("PUT", `/api/timetable/${row.id}`, body)
         : api("POST", "/api/timetable", body);
     },
-    row ? () => api("DELETE", `/api/timetable/${row.id}`) : null);
+  );
 }
 
 function editException(exc) {
@@ -1968,8 +2306,8 @@ function editException(exc) {
 
   const fields = [
     field("Week", textInput("ex-week", exc?.week ?? "", { type: "number" })),
-    field("Course code", textInput("ex-code", exc?.course_code)),
-    field("Section", textInput("ex-section", exc?.section)),
+    field("Course code", courseInput("ex-code", exc?.course_code)),
+    field("Section", sectionInput("ex-section", exc?.section)),
     field("What", actionSelect),
     field("Day", daySelect("ex-day", exc?.day || "", { allowBlank: true })),
     field("Starts", textInput("ex-start", exc?.start || "", { type: "time" })),
@@ -2001,7 +2339,7 @@ function editException(exc) {
         ? api("PUT", `/api/exceptions/${exc.id}`, body)
         : api("POST", "/api/exceptions", body);
     },
-    exc ? () => api("DELETE", `/api/exceptions/${exc.id}`) : null);
+  );
 
   setTimeout(showStaff, 0);
 }
@@ -2030,7 +2368,7 @@ function editStaff(person) {
         ? api("PUT", `/api/staff/${person.id}`, body)
         : api("POST", "/api/staff", body);
     },
-    person ? () => api("DELETE", `/api/staff/${person.id}`) : null);
+  );
 }
 
 // ------------------------------------------------------------ routing
@@ -2057,6 +2395,9 @@ function go(view) {
     coursePreview = null;
     importPreview = null;
     wizard = null;
+    selected.clear();
+    plannerQuery = "";
+    gapsOnly = false;
   }
   location.hash = view;
   render();
