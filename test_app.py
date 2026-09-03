@@ -46,7 +46,7 @@ def row_id(client, code, section) -> int:
 
 def test_seed_survives_a_round_trip(conn):
     seed.load(conn)
-    weeks, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
+    weeks, staff, timetable, exceptions, assignments, courses = store.load_all(conn, seed.TERM)
     assert len(weeks) == 12
     assert len(staff) == len(seed.STAFF)
     assert len(timetable) == len(seed.TIMETABLE)
@@ -60,24 +60,24 @@ def test_seed_survives_a_round_trip(conn):
 
 def test_the_sample_data_has_a_gap_to_show(conn):
     seed.load(conn)
-    _, _, timetable, exceptions, assignments, courses = store.load_all(conn)
+    _, _, timetable, exceptions, assignments, courses = store.load_all(conn, seed.TERM)
     cover = engine.coverage(engine.expand(timetable, exceptions, assignments, courses))
     assert 0 < cover.covered < cover.total
 
 
 def test_one_person_per_class_per_week_is_a_rule_of_the_database(conn):
     seed.load(conn)
-    tt = store.get_timetable(conn)[0]
+    tt = store.get_timetable(conn, seed.TERM)[0]
     store.set_assignment(conn, tt.id, [1], "ahern")
     store.set_assignment(conn, tt.id, [1], "brill")
-    held = [a for a in store.get_assignments(conn) if a.timetable_id == tt.id and a.week == 1]
+    held = [a for a in store.get_assignments(conn, seed.TERM) if a.timetable_id == tt.id and a.week == 1]
     assert len(held) == 1
     assert held[0].staff_id == "brill"
 
 
 def test_removing_a_week_from_a_class_removes_its_staffing(conn):
     seed.load(conn)
-    tt = next(r for r in store.get_timetable(conn) if r.weeks == frozenset(range(1, 13)))
+    tt = next(r for r in store.get_timetable(conn, seed.TERM) if r.weeks == frozenset(range(1, 13)))
     store.set_assignment(conn, tt.id, [12], "ahern")
     store.save_timetable_row(
         conn,
@@ -88,15 +88,16 @@ def test_removing_a_week_from_a_class_removes_its_staffing(conn):
             "weeks": list(range(1, 12)),
         },
         row_id=tt.id,
+        term=seed.TERM,
     )
-    weeks_held = {a.week for a in store.get_assignments(conn) if a.timetable_id == tt.id}
+    weeks_held = {a.week for a in store.get_assignments(conn, seed.TERM) if a.timetable_id == tt.id}
     assert 12 not in weeks_held
 
 
 def test_deleting_a_person_leaves_their_classes_uncovered_not_missing(conn):
     seed.load(conn)
     store.delete_staff(conn, "ahern")
-    _, _, timetable, exceptions, assignments, courses = store.load_all(conn)
+    _, _, timetable, exceptions, assignments, courses = store.load_all(conn, seed.TERM)
     assert all(a.staff_id != "ahern" for a in assignments)
     classes = engine.expand(timetable, exceptions, assignments, courses)
     assert any(c.label == "133150 SHOW-A" and not c.covered for c in classes)
@@ -109,7 +110,7 @@ def test_renaming_a_person_carries_their_assignments(conn):
         {"id": "ahern2", "name": "Ahern, Kate", "email": "", "target_minutes": 480},
         original_id="ahern",
     )
-    assignments = store.get_assignments(conn)
+    assignments = store.get_assignments(conn, seed.TERM)
     assert any(a.staff_id == "ahern2" for a in assignments)
     assert all(a.staff_id != "ahern" for a in assignments)
 
@@ -489,7 +490,7 @@ def upload(client, path, data, name="courses.csv"):
 def test_the_sample_catalogue_is_bigger_than_the_timetable(conn):
     seed.load(conn)
     courses = store.get_courses(conn)
-    timetabled = {r.course_code for r in store.get_timetable(conn)}
+    timetabled = {r.course_code for r in store.get_timetable(conn, seed.TERM)}
     assert len(courses) > len(timetabled)
     assert {c.code for c in courses} > timetabled
 
@@ -567,15 +568,25 @@ def test_importing_no_courses_is_refused(client):
     assert client.post("/api/courses/import/commit", json={"rows": []}).status_code == 400
 
 
-def test_the_offering_being_planned_can_be_set_and_cleared(client):
-    client.put("/api/settings", json={"academic_year": "2026", "semester": "S1FS"})
-    state = client.get("/api/state").json()
-    assert state["settings"] == {"academic_year": "2026", "semester": "S1FS"}
-    # every timetabled course is a 2027 S2FS offering, so they are all flagged now
-    assert any("not as an offering in S1FS 2026" in i for i in state["issues"])
+def test_switching_term_switches_the_whole_plan(client):
+    """A term holds its own calendar, timetable and staffing. The catalogue does
+    not: a course keeps its name whichever semester you are planning."""
+    before = client.get("/api/state").json()
+    assert before["settings"] == {"academic_year": "2027", "semester": "S2FS"}
+    assert before["weeks"] and before["timetable"]
 
-    client.put("/api/settings", json={"academic_year": "", "semester": ""})
-    assert client.get("/api/state").json()["issues"] == []
+    client.put("/api/settings", json={"academic_year": "2028", "semester": "S1FS"})
+    empty = client.get("/api/state").json()
+    assert empty["weeks"] == [] and empty["timetable"] == []
+    assert empty["courses"]                       # the catalogue is not term scoped
+    assert {(t["academic_year"], t["semester"]) for t in empty["terms"]} >= {
+        ("2027", "S2FS"), ("2028", "S1FS"),
+    }
+
+    client.put("/api/settings", json={"academic_year": "2027", "semester": "S2FS"})
+    back = client.get("/api/state").json()
+    assert len(back["timetable"]) == len(before["timetable"])
+    assert back["coverage"] == before["coverage"]
 
 
 def test_a_course_can_be_removed(client):
@@ -632,7 +643,7 @@ def test_the_sample_is_the_real_courses(conn):
     assert courses["133150"].coordinator == "Andre Ktori"
 
     # Labour Day falls on the Monday of the last teaching week.
-    weeks = {w.number: w for w in store.get_weeks(conn)}
+    weeks = {w.number: w for w in store.get_weeks(conn, seed.TERM)}
     assert weeks[12].starts.isoformat() == "2027-10-25"
     assert "Labour Day" in weeks[12].note
 
@@ -640,7 +651,7 @@ def test_the_sample_is_the_real_courses(conn):
 def test_a_coordinator_is_never_a_teacher(conn):
     """The distinction the whole catalogue rests on."""
     seed.load(conn)
-    _, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
+    _, staff, timetable, exceptions, assignments, courses = store.load_all(conn, seed.TERM)
     classes = engine.expand(timetable, exceptions, assignments, courses)
 
     coordinators = {c.coordinator for c in courses} | {c.offering_coordinator for c in courses}
@@ -673,7 +684,7 @@ def test_a_cleared_database_stays_cleared_across_a_restart(conn):
     if store.is_new(conn):                     # simulate app start
         seed.load(conn)
     assert store.get_courses(conn) == []
-    assert store.get_timetable(conn) == []
+    assert store.get_timetable(conn, seed.TERM) == []
 
 
 def test_a_catalogue_imported_before_any_timetable_is_not_overwritten(conn):
@@ -774,3 +785,105 @@ def test_state_says_who_teaches_each_course(client):
     teaching = client.get("/api/state").json()["teaching"]
     assert teaching["133150"] == ["ahern", "brill", "chen"]   # not SHOW-D, nobody has it
     assert "133167" not in teaching                            # not timetabled
+
+
+# ------------------------------------------------------------ terms
+
+def test_two_terms_hold_separate_calendars_without_colliding(conn):
+    """Week 1 exists in both and means different dates. It could not before."""
+    seed.load(conn)
+    other = ("2028", "S1FS")
+    store.replace_weeks(conn, [
+        {"number": 1, "starts": "2028-02-21", "ends": "2028-02-27", "note": ""},
+        {"number": 2, "starts": "2028-02-28", "ends": "2028-03-05", "note": ""},
+    ], term=other)
+    store.save_timetable_row(conn, {
+        "course_code": "133167", "section": "LEC", "day": "Monday",
+        "start": "09:00", "end": "10:00", "weeks": [1, 2],
+    }, term=other)
+
+    assert len(store.get_weeks(conn, seed.TERM)) == 12
+    assert len(store.get_weeks(conn, other)) == 2
+    assert store.get_weeks(conn, seed.TERM)[0].starts.isoformat() == "2027-07-26"
+    assert store.get_weeks(conn, other)[0].starts.isoformat() == "2028-02-21"
+    assert len(store.get_timetable(conn, other)) == 1
+    assert store.get_assignments(conn, other) == []      # nothing staffed there yet
+    assert len(store.get_assignments(conn, seed.TERM)) > 0
+    assert set(store.terms(conn)) >= {seed.TERM, other}
+
+
+def test_a_database_from_before_terms_keeps_everything(tmp_path):
+    """The migration rebuilds weeks and tags rows with the term in settings."""
+    old = store.connect(tmp_path / "old.db")
+    old.executescript("""
+        CREATE TABLE weeks (
+            number INTEGER PRIMARY KEY, starts TEXT NOT NULL,
+            ends TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+        CREATE TABLE timetable (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, course_code TEXT NOT NULL,
+            section TEXT NOT NULL, day TEXT NOT NULL,
+            start TEXT NOT NULL, end TEXT NOT NULL
+        );
+        INSERT INTO weeks (number, starts, ends, note)
+            VALUES (1, '2027-07-26', '2027-08-01', 'first week');
+        INSERT INTO settings (key, value)
+            VALUES ('academic_year', '2027'), ('semester', 'S2FS');
+        INSERT INTO timetable (course_code, section, day, start, end)
+            VALUES ('133150', 'SHOW-A', 'Tuesday', '14:00', '17:00');
+    """)
+    old.commit()
+
+    store.init(old)
+
+    weeks = store.get_weeks(old, ("2027", "S2FS"))
+    assert [w.number for w in weeks] == [1]
+    assert weeks[0].note == "first week"                 # nothing lost
+    rows = store.get_timetable(old, ("2027", "S2FS"))
+    assert [r.label for r in rows] == ["133150 SHOW-A"]
+    assert store.get_weeks(old, ("", "")) == []          # tagged, not stranded
+    old.close()
+
+
+# ------------------------------------------------------------ the week wizard
+
+def test_a_calendar_is_generated_from_how_people_describe_a_semester(client):
+    reply = client.post("/api/weeks/generate", json={
+        "first_monday": "2028-02-21", "count": 12,
+        "breaks": [{"starts": "2028-04-03", "ends": "2028-04-14"}],
+    })
+    assert reply.status_code == 200
+
+    weeks = client.get("/api/state").json()["weeks"]
+    assert [w["number"] for w in weeks] == list(range(1, 13))
+    assert weeks[0]["starts"] == "2028-02-21"
+    assert any("Break follows" in w["note"] for w in weeks)
+    # the break is a gap, not an extra week
+    assert weeks[6]["starts"] > weeks[5]["ends"]
+
+
+def test_generating_a_calendar_replaces_only_its_own_term(client):
+    before = len(client.get("/api/state").json()["timetable"])
+    client.post("/api/weeks/generate", json={"first_monday": "2027-07-26", "count": 6})
+
+    state = client.get("/api/state").json()
+    assert len(state["weeks"]) == 6
+    assert len(state["timetable"]) == before        # the plan is untouched
+
+    client.put("/api/settings", json={"academic_year": "2028", "semester": "S1FS"})
+    client.post("/api/weeks/generate", json={"first_monday": "2028-02-21", "count": 4})
+    assert len(client.get("/api/state").json()["weeks"]) == 4
+
+    client.put("/api/settings", json={"academic_year": "2027", "semester": "S2FS"})
+    assert len(client.get("/api/state").json()["weeks"]) == 6
+
+
+def test_a_calendar_the_tool_cannot_build_is_refused(client):
+    assert client.post("/api/weeks/generate", json={
+        "first_monday": "2027-07-26", "count": 0}).status_code == 400
+    assert client.post("/api/weeks/generate", json={
+        "first_monday": "not a date", "count": 12}).status_code == 400
+    assert client.post("/api/weeks/generate", json={
+        "first_monday": "2027-07-26", "count": 12,
+        "breaks": [{"starts": "2027-09-17", "ends": "2027-09-06"}]}).status_code == 400

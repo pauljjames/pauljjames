@@ -32,9 +32,22 @@ clear the lot. Deleting the file starts over.
 
 Five things you hold, one thing the tool works out.
 
-**Weeks** is the teaching calendar. Weeks are numbered consecutively through
-teaching, so a mid semester break is a gap between dates rather than an extra
-week. You set the Monday and the end of the week follows.
+**Weeks** is the teaching calendar, and it belongs to a semester. Weeks are
+numbered consecutively through teaching, so a break is a gap between dates
+rather than an extra week.
+
+You do not enter them one at a time. Setup asks when teaching starts, how many
+weeks it runs, and when the breaks are, and builds the calendar from that,
+noting the break on the week before it. A start that is not a Monday is taken as
+the Monday of that week.
+
+**A term** is a year and a semester together, and the plan belongs to one. The
+calendar, the timetable, the exceptions and the staffing are all a term's; the
+course catalogue is not, because a course keeps its name whichever semester you
+are planning. The picker at the top of every page switches between terms, and
+naming a semester with nothing in it is how you start planning a new one. Week 1
+of S1FS 2028 and week 1 of S2FS 2027 are different weeks with different dates,
+and neither disturbs the other.
 
 **Staff** is the people you are responsible for. Each can have a target of
 contact hours a week, which is what the Load page and the utilisation bars
@@ -247,7 +260,7 @@ from the class it sits beside rather than the same thing counted twice.
 python -m pytest
 ```
 
-173 tests. The engine cases came from two real course outlines: a lecture
+187 tests. The engine cases came from two real course outlines: a lecture
 running in three weeks only, workshops shortened in those weeks so the lecturer
 is not double booked, a public holiday cancellation, a one week substitution,
 split semester teaching, and an added crit session.
@@ -300,6 +313,6 @@ short version is: restart `python app.py` after replacing any files.
   is the intended path and hands those records over to you; removing the sample
   afterwards leaves them alone.
 - No notifications yet. The engine returns everything needed to build them.
-- All courses share one teaching calendar. If some run to a different pattern,
-  weeks gain a calendar name and clash detection matches on calendar plus week.
-  That is one extra column in three places rather than a rebuild.
+- Within one term, all courses share one teaching calendar. If some run to a
+  different pattern inside a semester, weeks would need a calendar name as well
+  as a term.

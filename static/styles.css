@@ -89,6 +89,18 @@ header {
 
 .term { color: var(--quiet); font-size: 0.85rem; }
 
+.termpick {
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 620;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0.15rem 0.4rem;
+}
+.termpick:hover { border-color: var(--quiet); }
+
 .verdict {
   margin-left: auto;
   border: 1px solid var(--rule);

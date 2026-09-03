@@ -21,38 +21,37 @@ again without touching anything imported or typed.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date
 
+import engine
 import store
 
 YEAR = "2027"
 SEMESTER = "S2FS"
 OCCURRENCE = "WLGI"
 
+TERM = (YEAR, SEMESTER)
+
 # Semester two, 2027: twelve teaching weeks from Monday 26 July with a fortnight
-# of mid semester break, which puts Labour Day on the Monday of week 12.
+# of mid semester break, which puts Labour Day on the Monday of week 12. Built
+# the same way the Setup wizard builds one, rather than written out by hand.
 FIRST_MONDAY = date(2027, 7, 26)
-BREAK_AFTER = 6
+TEACHING_WEEKS = 12
+BREAKS = [(date(2027, 9, 6), date(2027, 9, 17))]
 
-WEEK_NOTES = {
-    6: "Mid semester break follows, 6 to 17 September",
-    12: "Last teaching week. Labour Day, Monday 25 October",
-}
+WEEK_NOTES = {12: "Last teaching week. Labour Day, Monday 25 October"}
 
 
-def weeks() -> list[tuple[int, str, str, str]]:
-    out, monday = [], FIRST_MONDAY
-    for number in range(1, 13):
-        if number == BREAK_AFTER + 1:
-            monday += timedelta(days=14)
-        out.append((
-            number,
-            monday.isoformat(),
-            (monday + timedelta(days=6)).isoformat(),
-            WEEK_NOTES.get(number, ""),
-        ))
-        monday += timedelta(days=7)
-    return out
+def weeks() -> list[dict]:
+    return [
+        {
+            "number": w.number,
+            "starts": w.starts.isoformat(),
+            "ends": w.ends.isoformat(),
+            "note": WEEK_NOTES.get(w.number, w.note),
+        }
+        for w in engine.build_weeks(FIRST_MONDAY, TEACHING_WEEKS, BREAKS)
+    ]
 
 
 # Target contact minutes per week. Not everyone has one.
@@ -181,13 +180,7 @@ EXCEPTIONS = [
 
 
 def load(conn) -> None:
-    store.replace_weeks(
-        conn,
-        [
-            {"number": n, "starts": s, "ends": e, "note": note}
-            for n, s, e, note in weeks()
-        ],
-    )
+    store.replace_weeks(conn, weeks(), term=TERM)
 
     for staff_id, name, email, target in STAFF:
         store.save_staff(
@@ -218,13 +211,14 @@ def load(conn) -> None:
                 "end": end,
                 "weeks": runs,
             },
+            term=TERM,
         )
 
     for code, section, staff_id, runs in ASSIGNMENTS:
         store.set_assignment(conn, ids[(code, section)], runs, staff_id)
 
     for exc in EXCEPTIONS:
-        store.save_exception(conn, exc)
+        store.save_exception(conn, exc, term=TERM)
 
     store.mark_all_as_sample(conn)
     store.set_settings(conn, {

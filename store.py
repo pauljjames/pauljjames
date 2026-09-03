@@ -18,14 +18,22 @@ from engine import (
 
 DB_PATH = Path(__file__).parent / "timetable.db"
 
-SCHEMA = """
+# A term is a (academic_year, semester) pair. The plan belongs to one; the
+# course catalogue does not, since a course keeps its name across terms.
+WEEKS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS weeks (
-    number  INTEGER PRIMARY KEY,
-    starts  TEXT NOT NULL,
-    ends    TEXT NOT NULL,
-    note    TEXT NOT NULL DEFAULT '',
-    is_sample  INTEGER NOT NULL DEFAULT 0
+    academic_year  TEXT NOT NULL DEFAULT '',
+    semester       TEXT NOT NULL DEFAULT '',
+    number         INTEGER NOT NULL,
+    starts         TEXT NOT NULL,
+    ends           TEXT NOT NULL,
+    note           TEXT NOT NULL DEFAULT '',
+    is_sample      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (academic_year, semester, number)
 );
+"""
+
+SCHEMA = WEEKS_SCHEMA + """
 
 CREATE TABLE IF NOT EXISTS staff (
     id              TEXT PRIMARY KEY,
@@ -58,12 +66,15 @@ CREATE TABLE IF NOT EXISTS courses (
 
 -- A course is named in one place, so the timetable does not carry a title.
 CREATE TABLE IF NOT EXISTS timetable (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    course_code   TEXT NOT NULL,
-    section       TEXT NOT NULL,
-    day           TEXT NOT NULL,
-    start         TEXT NOT NULL,
-    end           TEXT NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    academic_year  TEXT NOT NULL DEFAULT '',
+    semester       TEXT NOT NULL DEFAULT '',
+    course_code    TEXT NOT NULL,
+    section        TEXT NOT NULL,
+    day            TEXT NOT NULL,
+    start          TEXT NOT NULL,
+    end            TEXT NOT NULL,
+    is_sample      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -91,7 +102,9 @@ CREATE TABLE IF NOT EXISTS assignments (
 );
 
 CREATE TABLE IF NOT EXISTS exceptions (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    academic_year  TEXT NOT NULL DEFAULT '',
+    semester       TEXT NOT NULL DEFAULT '',
     week          INTEGER NOT NULL,
     course_code   TEXT NOT NULL,
     section       TEXT NOT NULL,
@@ -157,11 +170,69 @@ def _add_column_if_missing(conn, table: str, column: str, declaration: str) -> N
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
+TERM_TABLES = ("timetable", "exceptions")
+
+
+def _active_term(conn) -> tuple[str, str]:
+    held = {r["key"]: r["value"] for r in conn.execute("SELECT * FROM settings")}
+    return (held.get("academic_year", ""), held.get("semester", ""))
+
+
+def _rebuild_weeks_for_terms(conn) -> None:
+    """weeks was keyed on the bare week number, which cannot hold two semesters.
+
+    SQLite will not alter a primary key, so the table is rebuilt. Nothing has a
+    foreign key to weeks, so this is safe; existing rows are tagged with
+    whichever term the settings say was being planned.
+    """
+    held = {r["name"] for r in conn.execute("PRAGMA table_info(weeks)")}
+    if "academic_year" in held:
+        return
+    term = _active_term(conn)
+    conn.execute("ALTER TABLE weeks RENAME TO weeks_before_terms")
+    conn.executescript(WEEKS_SCHEMA)
+    conn.execute(
+        "INSERT INTO weeks (academic_year, semester, number, starts, ends, note, is_sample)"
+        " SELECT ?, ?, number, starts, ends, note, is_sample FROM weeks_before_terms",
+        term,
+    )
+    conn.execute("DROP TABLE weeks_before_terms")
+
+
 def init(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     for table in SAMPLE_TABLES:
         _add_column_if_missing(conn, table, "is_sample", "INTEGER NOT NULL DEFAULT 0")
+
+    _rebuild_weeks_for_terms(conn)
+    for table in TERM_TABLES:
+        fresh = "academic_year" not in {
+            r["name"] for r in conn.execute(f"PRAGMA table_info({table})")
+        }
+        _add_column_if_missing(conn, table, "academic_year", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, table, "semester", "TEXT NOT NULL DEFAULT ''")
+        if fresh:
+            conn.execute(
+                f"UPDATE {table} SET academic_year = ?, semester = ?", _active_term(conn)
+            )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS ix_{table}_term"
+            f" ON {table} (academic_year, semester)"
+        )
     conn.commit()
+
+
+def terms(conn) -> list[tuple[str, str]]:
+    """Every term that has a plan, newest looking first."""
+    found = {
+        (r["academic_year"], r["semester"])
+        for r in conn.execute(
+            "SELECT academic_year, semester FROM weeks"
+            " UNION SELECT academic_year, semester FROM timetable"
+        )
+    }
+    found.add(_active_term(conn))
+    return sorted(found, key=lambda t: (t[0], t[1]), reverse=True)
 
 
 def is_new(conn: sqlite3.Connection) -> bool:
@@ -215,21 +286,34 @@ def remove_sample(conn) -> dict:
             cur = conn.execute(f"DELETE FROM {table} WHERE is_sample = 1")
             removed[table] = max(cur.rowcount, 0)
 
-        # The offering being planned came with the sample, so it goes with it,
-        # unless it has since been changed to something the user chose.
+        # The term being planned came with the sample, so it goes with it, unless
+        # it has been changed to one the user chose, or something of theirs is
+        # still in it. Clearing the term while their rows sit inside it would
+        # hide those rows behind a term nobody is looking at.
         settings = get_settings(conn)
         planned = settings.get("sample_planning", "")
-        if planned and planned == f"{settings.get('academic_year', '')}|{settings.get('semester', '')}":
-            conn.execute(
-                "UPDATE settings SET value = '' WHERE key IN ('academic_year', 'semester')"
-            )
+        current = f"{settings.get('academic_year', '')}|{settings.get('semester', '')}"
+        if planned and planned == current:
+            year, semester = planned.split("|", 1)
+            survived = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM weeks"
+                "          WHERE academic_year = ? AND semester = ?)"
+                "     + (SELECT COUNT(*) FROM timetable"
+                "          WHERE academic_year = ? AND semester = ?)",
+                (year, semester, year, semester),
+            ).fetchone()[0]
+            if not survived:
+                conn.execute(
+                    "UPDATE settings SET value = ''"
+                    " WHERE key IN ('academic_year', 'semester')"
+                )
         conn.execute("DELETE FROM settings WHERE key = 'sample_planning'")
     return removed
 
 
 # ------------------------------------------------------------ reading
 
-def get_weeks(conn) -> list[Week]:
+def get_weeks(conn, term: tuple[str, str] = ("", "")) -> list[Week]:
     return [
         Week(
             number=r["number"],
@@ -237,7 +321,10 @@ def get_weeks(conn) -> list[Week]:
             ends=date.fromisoformat(r["ends"]),
             note=r["note"],
         )
-        for r in conn.execute("SELECT * FROM weeks ORDER BY number")
+        for r in conn.execute(
+            "SELECT * FROM weeks WHERE academic_year = ? AND semester = ?"
+            " ORDER BY number", term
+        )
     ]
 
 
@@ -274,7 +361,7 @@ def get_settings(conn) -> dict:
     return {r["key"]: r["value"] for r in conn.execute("SELECT * FROM settings")}
 
 
-def get_timetable(conn) -> list[TimetableRow]:
+def get_timetable(conn, term: tuple[str, str] = ("", "")) -> list[TimetableRow]:
     weeks_by_row: dict[int, set[int]] = {}
     for r in conn.execute("SELECT * FROM timetable_weeks"):
         weeks_by_row.setdefault(r["timetable_id"], set()).add(r["week"])
@@ -290,23 +377,27 @@ def get_timetable(conn) -> list[TimetableRow]:
             weeks=frozenset(weeks_by_row.get(r["id"], set())),
         )
         for r in conn.execute(
-            "SELECT * FROM timetable ORDER BY course_code, section, id"
+            "SELECT * FROM timetable WHERE academic_year = ? AND semester = ?"
+            " ORDER BY course_code, section, id", term
         )
     ]
 
 
-def get_assignments(conn) -> list[Assignment]:
+def get_assignments(conn, term: tuple[str, str] = ("", "")) -> list[Assignment]:
+    """Assignments hang off timetable rows, so the row's term scopes them."""
     return [
         Assignment(
             timetable_id=r["timetable_id"], week=r["week"], staff_id=r["staff_id"]
         )
         for r in conn.execute(
-            "SELECT * FROM assignments ORDER BY timetable_id, week"
+            "SELECT a.* FROM assignments a JOIN timetable t ON t.id = a.timetable_id"
+            " WHERE t.academic_year = ? AND t.semester = ?"
+            " ORDER BY a.timetable_id, a.week", term
         )
     ]
 
 
-def get_exceptions(conn) -> list[ExceptionRow]:
+def get_exceptions(conn, term: tuple[str, str] = ("", "")) -> list[ExceptionRow]:
     return [
         ExceptionRow(
             id=r["id"],
@@ -321,31 +412,37 @@ def get_exceptions(conn) -> list[ExceptionRow]:
             note=r["note"],
         )
         for r in conn.execute(
-            "SELECT * FROM exceptions ORDER BY week, course_code, section, id"
+            "SELECT * FROM exceptions WHERE academic_year = ? AND semester = ?"
+            " ORDER BY week, course_code, section, id", term
         )
     ]
 
 
-def load_all(conn):
+def load_all(conn, term: tuple[str, str] = ("", "")):
+    """One term's plan, plus the whole catalogue."""
     return (
-        get_weeks(conn),
+        get_weeks(conn, term),
         get_staff(conn),
-        get_timetable(conn),
-        get_exceptions(conn),
-        get_assignments(conn),
+        get_timetable(conn, term),
+        get_exceptions(conn, term),
+        get_assignments(conn, term),
         get_courses(conn),
     )
 
 
 # ------------------------------------------------------------ writing
 
-def replace_weeks(conn, rows: list[dict]) -> None:
+def replace_weeks(conn, rows: list[dict], term: tuple[str, str] = ("", "")) -> None:
+    """Swap in one term's calendar, leaving every other term alone."""
     with conn:
-        conn.execute("DELETE FROM weeks")
+        conn.execute(
+            "DELETE FROM weeks WHERE academic_year = ? AND semester = ?", term
+        )
         conn.executemany(
-            "INSERT INTO weeks (number, starts, ends, note) VALUES (?, ?, ?, ?)",
+            "INSERT INTO weeks (academic_year, semester, number, starts, ends, note)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
             [
-                (int(r["number"]), r["starts"], r["ends"], r.get("note") or "")
+                term + (int(r["number"]), r["starts"], r["ends"], r.get("note") or "")
                 for r in rows
             ],
         )
@@ -398,8 +495,10 @@ def _write_weeks_for_row(conn, timetable_id: int, weeks) -> None:
     )
 
 
-def save_timetable_row(conn, row: dict, row_id: int | None = None) -> int:
-    values = (
+def save_timetable_row(
+    conn, row: dict, row_id: int | None = None, term: tuple[str, str] = ("", "")
+) -> int:
+    values = term + (
         row["course_code"],
         row["section"],
         row["day"],
@@ -410,15 +509,16 @@ def save_timetable_row(conn, row: dict, row_id: int | None = None) -> int:
     with conn:
         if row_id is None:
             cur = conn.execute(
-                "INSERT INTO timetable (course_code, section, day, start, end)"
-                " VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO timetable (academic_year, semester, course_code,"
+                " section, day, start, end) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 values,
             )
             row_id = cur.lastrowid
         else:
             conn.execute(
-                "UPDATE timetable SET course_code = ?, section = ?,"
-                " day = ?, start = ?, end = ?, is_sample = 0 WHERE id = ?",
+                "UPDATE timetable SET academic_year = ?, semester = ?,"
+                " course_code = ?, section = ?, day = ?, start = ?, end = ?,"
+                " is_sample = 0 WHERE id = ?",
                 values + (row_id,),
             )
             # A week the class no longer runs in cannot stay staffed.
@@ -471,8 +571,10 @@ def clear_assignment(conn, timetable_id: int, weeks: list[int] | None = None) ->
         return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 
-def save_exception(conn, row: dict, row_id: int | None = None) -> int:
-    values = (
+def save_exception(
+    conn, row: dict, row_id: int | None = None, term: tuple[str, str] = ("", "")
+) -> int:
+    values = term + (
         int(row["week"]),
         row["course_code"],
         row["section"],
@@ -486,15 +588,16 @@ def save_exception(conn, row: dict, row_id: int | None = None) -> int:
     with conn:
         if row_id is None:
             cur = conn.execute(
-                "INSERT INTO exceptions (week, course_code, section, action,"
-                " day, start, end, staff_id, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO exceptions (academic_year, semester, week, course_code,"
+                " section, action, day, start, end, staff_id, note)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 values,
             )
             return cur.lastrowid
         conn.execute(
-            "UPDATE exceptions SET week = ?, course_code = ?, section = ?, action = ?,"
-            " day = ?, start = ?, end = ?, staff_id = ?, note = ?, is_sample = 0"
-            " WHERE id = ?",
+            "UPDATE exceptions SET academic_year = ?, semester = ?, week = ?,"
+            " course_code = ?, section = ?, action = ?, day = ?, start = ?, end = ?,"
+            " staff_id = ?, note = ?, is_sample = 0 WHERE id = ?",
             values + (row_id,),
         )
     return row_id
@@ -584,7 +687,7 @@ def set_settings(conn, values: dict) -> None:
 
 # ------------------------------------------------------------ import
 
-def replace_timetable(conn, rows: list[dict]) -> dict:
+def replace_timetable(conn, rows: list[dict], term: tuple[str, str] = ("", "")) -> dict:
     """Swap in a freshly imported timetable, keeping staffing where it still fits.
 
     The timetable is somebody else's document and gets reissued. Staffing is the
@@ -592,8 +695,8 @@ def replace_timetable(conn, rows: list[dict]) -> dict:
     course, section and week. Anything that no longer has a class under it is
     reported rather than dropped quietly.
     """
-    old_rows = get_timetable(conn)
-    old_assignments = get_assignments(conn)
+    old_rows = get_timetable(conn, term)
+    old_assignments = get_assignments(conn, term)
     by_id = {r.id: r for r in old_rows}
 
     held: dict[tuple[str, str, int], str] = {}
@@ -602,14 +705,17 @@ def replace_timetable(conn, rows: list[dict]) -> dict:
         if row is not None:
             held[(row.course_code, row.section, a.week)] = a.staff_id
 
+    doomed = [r.id for r in old_rows]
     with conn:
-        conn.execute("DELETE FROM assignments")
-        conn.execute("DELETE FROM timetable_weeks")
-        conn.execute("DELETE FROM timetable")
+        conn.executemany("DELETE FROM assignments WHERE timetable_id = ?",
+                         [(i,) for i in doomed])
+        conn.executemany("DELETE FROM timetable_weeks WHERE timetable_id = ?",
+                         [(i,) for i in doomed])
+        conn.executemany("DELETE FROM timetable WHERE id = ?", [(i,) for i in doomed])
 
     kept, dropped = 0, []
     for row in rows:
-        new_id = save_timetable_row(conn, row)
+        new_id = save_timetable_row(conn, row, term=term)
         for week in sorted({int(w) for w in row.get("weeks") or []}):
             staff_id = held.pop((row["course_code"], row["section"], week), None)
             if staff_id is not None:

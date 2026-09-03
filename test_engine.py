@@ -8,7 +8,7 @@ The tests that matter most are the ones about refusing an assignment, because
 that refusal is what the tool is for.
 """
 
-from datetime import date, time
+from datetime import date, time, timedelta
 
 import pytest
 
@@ -16,6 +16,7 @@ from engine import (
     Action,
     Assignment,
     Course,
+    build_weeks,
     Class,
     ExceptionRow,
     StaffMember,
@@ -629,3 +630,68 @@ def test_shapes_covers_everybody_including_people_with_nothing():
     got = shapes(expand(tt, [], assign(1, "kate", [1])), staff, [1])
     assert [s.staff_id for s in got] == ["kate", "idle"]
     assert got[1].usual == ()
+
+
+# ------------------------------------------------------------ building a calendar
+
+def test_a_semester_with_no_breaks_is_consecutive_mondays():
+    built = build_weeks(date(2027, 7, 26), 4)
+    assert [w.number for w in built] == [1, 2, 3, 4]
+    assert [w.starts.isoformat() for w in built] == [
+        "2027-07-26", "2027-08-02", "2027-08-09", "2027-08-16",
+    ]
+    assert all(w.ends == w.starts + timedelta(days=6) for w in built)
+    assert all(w.note == "" for w in built)
+
+
+def test_a_break_is_a_gap_between_dates_not_an_extra_week():
+    built = build_weeks(date(2027, 7, 26), 12, [(date(2027, 9, 6), date(2027, 9, 17))])
+    assert [w.number for w in built] == list(range(1, 13))     # still twelve
+    assert built[5].starts.isoformat() == "2027-08-30"          # week 6 before
+    assert built[6].starts.isoformat() == "2027-09-20"          # week 7 after
+    assert built[5].note == "Break follows, 6 to 17 September"
+    assert built[6].note == ""
+
+
+def test_the_last_teaching_week_lands_where_the_semester_really_ends():
+    """Twelve weeks from 26 July 2027 with that break puts Labour Day in week 12."""
+    built = build_weeks(date(2027, 7, 26), 12, [(date(2027, 9, 6), date(2027, 9, 17))])
+    assert built[-1].starts == date(2027, 10, 25)
+
+
+def test_two_breaks_are_both_skipped_and_both_named():
+    built = build_weeks(date(2027, 7, 26), 6, [
+        (date(2027, 8, 9), date(2027, 8, 13)),
+        (date(2027, 8, 30), date(2027, 9, 3)),
+    ])
+    assert [w.starts.isoformat() for w in built] == [
+        "2027-07-26", "2027-08-02", "2027-08-16", "2027-08-23",
+        "2027-09-06", "2027-09-13",
+    ]
+    assert built[1].note == "Break follows, 9 to 13 August"
+    assert built[3].note == "Break follows, 30 August to 3 September"
+
+
+def test_a_break_spanning_months_reads_properly():
+    built = build_weeks(date(2027, 8, 23), 2, [(date(2027, 8, 30), date(2027, 9, 10))])
+    assert built[0].note == "Break follows, 30 August to 10 September"
+
+
+def test_a_start_that_is_not_a_monday_is_taken_as_that_monday():
+    """People give the date teaching starts, not always a Monday."""
+    for day in range(26, 32):          # Mon 26 July to Sat 31 July 2027
+        assert build_weeks(date(2027, 7, day), 1)[0].starts == date(2027, 7, 26)
+
+
+def test_a_break_before_teaching_starts_changes_nothing():
+    built = build_weeks(date(2027, 7, 26), 2, [(date(2027, 7, 1), date(2027, 7, 9))])
+    assert [w.starts.isoformat() for w in built] == ["2027-07-26", "2027-08-02"]
+
+
+def test_a_semester_of_no_weeks_is_no_weeks():
+    assert build_weeks(date(2027, 7, 26), 0) == []
+
+
+def test_a_backwards_break_is_ignored_rather_than_looping():
+    built = build_weeks(date(2027, 7, 26), 2, [(date(2027, 9, 10), date(2027, 9, 1))])
+    assert len(built) == 2

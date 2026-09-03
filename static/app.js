@@ -3,7 +3,7 @@
 // Kept in step with VERSION in app.py. The browser reads this file fresh on
 // every load but the routes live in the running server, so a new front end can
 // meet an old one. This is what lets the page say so.
-const APP_VERSION = "2026-09-03.2";
+const APP_VERSION = "2026-09-04.1";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
               "Saturday", "Sunday"];
@@ -131,7 +131,9 @@ function dayKey() {
 // ------------------------------------------------------------ loading
 
 async function refresh() {
+  const before = state && state.settings;
   state = await api("GET", "/api/state");
+  if (before && !sameTerm(before, state.settings)) wizard = null;
   assignColours();
   renderChrome();
   render();
@@ -145,7 +147,44 @@ function staleServerBanner() {
     el("span", { class: "muted", text: `Page ${APP_VERSION}, server ${state.version}.` }));
 }
 
+const termLabel = (t) =>
+  t.semester || t.academic_year
+    ? `${t.semester} ${t.academic_year}`.trim()
+    : "No semester set";
+
+const sameTerm = (a, b) =>
+  a.academic_year === b.academic_year && a.semester === b.semester;
+
+function renderTermPicker() {
+  const picker = $("#termpick");
+  const here = state.settings || { academic_year: "", semester: "" };
+  const known = state.terms || [];
+
+  picker.replaceChildren();
+  for (const term of known) {
+    picker.append(el("option", {
+      value: `${term.academic_year}|${term.semester}`,
+      selected: sameTerm(term, here),
+    }, termLabel(term)));
+  }
+  picker.append(el("option", { value: "+" }, "Set up another semester…"));
+
+  picker.onchange = async () => {
+    if (picker.value === "+") {
+      picker.value = `${here.academic_year}|${here.semester}`;
+      go("setup");
+      return;
+    }
+    const [academic_year, semester] = picker.value.split("|");
+    try {
+      await api("PUT", "/api/settings", { academic_year, semester });
+      await refresh();
+    } catch (error) { toast(error.message, true); }
+  };
+}
+
 function renderChrome() {
+  renderTermPicker();
   const weeks = state.weeks;
   $("#term").textContent = weeks.length
     ? `${weeks.length} teaching weeks, ${shortDate(weeks[0].starts)} to ${shortDate(weeks[weeks.length - 1].ends)}`
@@ -155,7 +194,11 @@ function renderChrome() {
   const gaps = cover.total - cover.covered;
   const verdict = $("#verdict");
 
-  if (state.problems.length) {
+  if (!cover.total) {
+    // Nothing is timetabled, so "fully staffed" would be a lie about an empty term.
+    verdict.textContent = "Nothing planned yet";
+    verdict.className = "verdict";
+  } else if (state.problems.length) {
     verdict.textContent = `${state.problems.length} clash${state.problems.length > 1 ? "es" : ""}`;
     verdict.className = "verdict bad";
   } else if (gaps) {
@@ -1307,45 +1350,7 @@ function setupView() {
   wrap.append(offeringPanel());
   wrap.append(importPanel());
 
-  // weeks
-  const weeksPanel = el("section", { class: "panel" },
-    el("div", { class: "toolbar" },
-      el("h2", { text: "Teaching calendar" }),
-      el("span", { class: "spacer" }),
-      el("button", { class: "action", text: "Add a week", onclick: addWeek }),
-      state.weeks.length
-        ? el("button", { class: "link danger", text: "Remove the last week", onclick: removeLastWeek })
-        : null));
-
-  weeksPanel.append(el("p", { class: "hint" },
-    "Weeks are numbered consecutively through teaching, so a mid semester break ",
-    "is a gap between dates rather than an extra week."));
-
-  if (state.weeks.length) {
-    const table = el("table", {},
-      el("thead", {}, el("tr", {},
-        el("th", { text: "Week" }), el("th", { text: "Monday" }),
-        el("th", { text: "Ends" }), el("th", { text: "Note" }))));
-    const body = el("tbody");
-    for (const week of state.weeks) {
-      body.append(el("tr", {},
-        el("td", { text: String(week.number) }),
-        el("td", {}, el("input", {
-          type: "date", value: week.starts,
-          onchange: (e) => saveWeek(week.number, "starts", e.target.value),
-        })),
-        el("td", { class: "muted", text: shortDate(week.ends) }),
-        el("td", {}, el("input", {
-          type: "text", value: week.note || "", placeholder: "—",
-          onchange: (e) => saveWeek(week.number, "note", e.target.value),
-        }))));
-    }
-    table.append(body);
-    weeksPanel.append(table);
-  } else {
-    weeksPanel.append(el("p", { class: "empty", text: "No weeks yet." }));
-  }
-  wrap.append(weeksPanel);
+  wrap.append(calendarPanel());
 
   // data
   wrap.append(el("section", { class: "panel" },
@@ -1394,12 +1399,13 @@ function offeringPanel() {
   const years = [...new Set(state.courses.map((c) => c.academic_year).filter(Boolean))].sort();
 
   const panel = el("section", { class: "panel" },
-    el("h2", { text: "What you are planning" }));
+    el("h2", { text: "Which semester" }));
 
   panel.append(el("p", { class: "hint" },
-    "The year and semester this timetable is for. Setting it is optional; it is ",
-    "used to say when a timetabled class is not an offering in the semester you ",
-    "are planning, which usually means the wrong course code."));
+    "The semester you are planning. Everything else in the tool shows this one: ",
+    "its calendar, its timetable and its staffing. Naming a semester that has ",
+    "nothing in it yet is how you start planning a new one — the others are left ",
+    "exactly as they are, and the picker at the top switches between them."));
 
   const yearInput = el("input", {
     id: "set-year", type: "text", value: settings.academic_year || "",
@@ -1555,6 +1561,141 @@ async function commitImport(mode) {
     toast(result.kept
       ? `Imported ${result.added} classes, keeping ${result.kept} staffed weeks.`
       : `Imported ${result.added} classes.`);
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+// ------------------------------------------------------------ the calendar
+
+// What the wizard is holding, which survives a re-render while you type.
+let wizard = null;
+
+const wizardDefaults = () => ({
+  first_monday: state.weeks.length ? state.weeks[0].starts : "",
+  count: state.weeks.length || 12,
+  breaks: [],
+});
+
+function calendarPanel() {
+  if (!wizard) wizard = wizardDefaults();
+
+  const panel = el("section", { class: "panel" },
+    el("h2", {}, "Teaching calendar for ",
+      el("strong", { text: termLabel(state.settings || {}) })));
+
+  panel.append(el("p", { class: "hint" },
+    "Say when teaching starts, how long it runs, and when the breaks are. Weeks ",
+    "are numbered consecutively through teaching, so a break is a gap between ",
+    "dates rather than an extra week, and the week before one says so."));
+
+  panel.append(el("div", { class: "toolbar" },
+    el("label", { class: "inline" },
+      el("span", { text: "Teaching starts" }),
+      el("input", {
+        type: "date", value: wizard.first_monday,
+        oninput: (e) => { wizard.first_monday = e.target.value; },
+      })),
+    el("label", { class: "inline" },
+      el("span", { text: "Teaching weeks" }),
+      el("input", {
+        type: "number", min: "1", max: "52", value: String(wizard.count),
+        style: "max-width: 5rem",
+        oninput: (e) => { wizard.count = Number(e.target.value); },
+      }))));
+
+  wizard.breaks.forEach((gap, index) => {
+    panel.append(el("div", { class: "toolbar" },
+      el("label", { class: "inline" },
+        el("span", { text: `Break ${index + 1}` }),
+        el("input", {
+          type: "date", value: gap.starts,
+          oninput: (e) => { wizard.breaks[index].starts = e.target.value; },
+        })),
+      el("label", { class: "inline" },
+        el("span", { text: "until" }),
+        el("input", {
+          type: "date", value: gap.ends,
+          oninput: (e) => { wizard.breaks[index].ends = e.target.value; },
+        })),
+      el("button", {
+        class: "link danger", text: "Remove",
+        onclick: () => { wizard.breaks.splice(index, 1); render(); },
+      })));
+  });
+
+  panel.append(el("div", { class: "toolbar" },
+    el("button", {
+      class: "link", text: "Add a break",
+      onclick: () => { wizard.breaks.push({ starts: "", ends: "" }); render(); },
+    }),
+    el("span", { class: "spacer" }),
+    el("button", {
+      class: "action primary",
+      text: state.weeks.length ? "Rebuild the calendar" : "Build the calendar",
+      onclick: buildCalendar,
+    })));
+
+  if (!state.weeks.length) {
+    panel.append(el("p", { class: "empty", text: "No calendar for this semester yet." }));
+    return panel;
+  }
+
+  panel.append(el("div", { class: "caption", style: "padding-top: 0.8rem",
+                           text: "The weeks it built" }));
+  panel.append(el("p", { class: "hint" },
+    "Correct a date or add a note here if one week needs it; rebuilding starts over."));
+
+  const table = el("table", {},
+    el("thead", {}, el("tr", {},
+      el("th", { text: "Week" }), el("th", { text: "Monday" }),
+      el("th", { text: "Ends" }), el("th", { text: "Note" }))));
+  const body = el("tbody");
+  for (const week of state.weeks) {
+    body.append(el("tr", {},
+      el("td", { text: String(week.number) }),
+      el("td", {}, el("input", {
+        type: "date", value: week.starts,
+        onchange: (e) => saveWeek(week.number, "starts", e.target.value),
+      })),
+      el("td", { class: "muted", text: shortDate(week.ends) }),
+      el("td", {}, el("input", {
+        type: "text", value: week.note || "", placeholder: "—",
+        onchange: (e) => saveWeek(week.number, "note", e.target.value),
+      }))));
+  }
+  table.append(body);
+  panel.append(table);
+
+  panel.append(el("div", { class: "toolbar" },
+    el("button", { class: "link", text: "Add a week at the end", onclick: addWeek }),
+    el("button", { class: "link danger", text: "Remove the last week",
+                   onclick: removeLastWeek })));
+  return panel;
+}
+
+async function buildCalendar() {
+  if (!wizard.first_monday) {
+    toast("Say when teaching starts.", true);
+    return;
+  }
+  if (state.weeks.length) {
+    const ok = await confirmDialog(
+      "Rebuild the calendar?",
+      `The ${state.weeks.length} weeks for ${termLabel(state.settings || {})} will be ` +
+      `replaced. Staffing is kept, but a class staffed in a week that no longer ` +
+      `exists becomes a problem to fix.`);
+    if (!ok) return;
+  }
+  try {
+    const result = await api("POST", "/api/weeks/generate", {
+      first_monday: wizard.first_monday,
+      count: wizard.count,
+      breaks: wizard.breaks.filter((gap) => gap.starts && gap.ends),
+    });
+    wizard = null;
+    toast(`${result.weeks.length} teaching weeks built.`);
     await refresh();
   } catch (error) {
     toast(error.message, true);
@@ -1915,6 +2056,7 @@ function go(view) {
     candidates = null;
     coursePreview = null;
     importPreview = null;
+    wizard = null;
   }
   location.hash = view;
   render();

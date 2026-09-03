@@ -31,7 +31,7 @@ into a timetable that other teams also teach; an empty slot means "not ours" or
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import date, time
+from datetime import date, time, timedelta
 from enum import Enum
 from itertools import combinations
 
@@ -307,6 +307,64 @@ class Coverage:
     @property
     def percent(self) -> int:
         return 100 if self.total == 0 else round(100 * self.covered / self.total)
+
+
+def _span(first: date, last: date) -> str:
+    """"6 to 17 September", or "30 August to 10 September"."""
+    if (first.month, first.year) == (last.month, last.year):
+        return f"{first.day} to {last.day} {last.strftime('%B')}"
+    return f"{first.day} {first.strftime('%B')} to {last.day} {last.strftime('%B')}"
+
+
+def _in_break(monday: date, breaks: list[tuple[date, date]]) -> bool:
+    ends = monday + timedelta(days=6)
+    return any(first <= ends and monday <= last for first, last in breaks)
+
+
+def build_weeks(
+    first_monday: date,
+    count: int,
+    breaks: list[tuple[date, date]] | None = None,
+) -> list[Week]:
+    """Turn the way people describe a semester into numbered teaching weeks.
+
+    Nobody holds a semester as "the Monday of week 7". They hold it as when
+    teaching starts, how many weeks it runs, and when the breaks are. This turns
+    the second into the first.
+
+    Weeks are numbered consecutively through teaching, so a break is a gap
+    between dates rather than an extra week, and the week before one says so. A
+    start that is not a Monday is taken as the Monday of that week.
+    """
+    if count < 1:
+        return []
+
+    monday = first_monday - timedelta(days=first_monday.weekday())
+    ranges = sorted((first, last) for first, last in (breaks or []) if first <= last)
+
+    dates: list[tuple[int, date, date]] = []
+    for number in range(1, count + 1):
+        while _in_break(monday, ranges):
+            monday += timedelta(days=7)
+        dates.append((number, monday, monday + timedelta(days=6)))
+        monday += timedelta(days=7)
+
+    weeks = []
+    for index, (number, starts, ends) in enumerate(dates):
+        note = ""
+        if index + 1 < len(dates):
+            next_starts = dates[index + 1][1]
+            if next_starts != ends + timedelta(days=1):
+                crossed = [
+                    (first, last) for first, last in ranges
+                    if ends < first and last < next_starts
+                ]
+                if crossed:
+                    note = "Break follows, " + " and ".join(
+                        _span(first, last) for first, last in crossed
+                    )
+        weeks.append(Week(number=number, starts=starts, ends=ends, note=note))
+    return weeks
 
 
 def _minutes(t: time) -> int:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
+from datetime import date
 from pathlib import Path
 
 import uvicorn
@@ -36,7 +37,17 @@ HERE = Path(__file__).parent
 # every load, but the routes live in this process, so an unrestarted server
 # serves a new front end against old endpoints. The front end compares this
 # against its own copy and says so rather than failing with a bare 404.
-VERSION = "2026-09-03.2"
+VERSION = "2026-09-04.1"
+
+
+def active_term(conn) -> tuple[str, str]:
+    """The term whose plan every page is showing.
+
+    Blank is a term like any other: it is what an unset tool, and anything
+    migrated from before terms existed, is planning.
+    """
+    held = store.get_settings(conn)
+    return (held.get("academic_year", ""), held.get("semester", ""))
 
 
 @contextmanager
@@ -122,6 +133,17 @@ class CommitIn(BaseModel):
 class CourseCommitIn(BaseModel):
     rows: list[dict]
     mode: str = "merge"          # merge | replace_offering | replace_all
+
+
+class BreakIn(BaseModel):
+    starts: str
+    ends: str
+
+
+class WeeksGenerateIn(BaseModel):
+    first_monday: str
+    count: int
+    breaks: list[BreakIn] = Field(default_factory=list)
 
 
 class SettingsIn(BaseModel):
@@ -257,9 +279,10 @@ def planning_from(settings: dict) -> tuple[str, str] | None:
 @app.get("/api/state")
 def state() -> dict:
     with db() as conn:
-        weeks, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
+        weeks, staff, timetable, exceptions, assignments, courses = store.load_all(conn, active_term(conn))
         settings = store.get_settings(conn)
         has_sample = store.has_sample(conn)
+        known_terms = store.terms(conn)
 
     classes = engine.expand(timetable, exceptions, assignments, courses)
     cover = engine.coverage(classes)
@@ -317,6 +340,10 @@ def state() -> dict:
         "courses": [course_json(c) for c in courses],
         "teaching": engine.teachers_for(classes),
         "has_sample": has_sample,
+        "terms": [
+            {"academic_year": year, "semester": semester}
+            for year, semester in known_terms
+        ],
         "settings": {
             "academic_year": settings.get("academic_year", ""),
             "semester": settings.get("semester", ""),
@@ -340,7 +367,7 @@ def availability(body: AvailabilityIn) -> dict:
     take a class is visibly unavailable rather than a refusal after the fact.
     """
     with db() as conn:
-        _, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
+        _, staff, timetable, exceptions, assignments, courses = store.load_all(conn, active_term(conn))
 
     classes = engine.expand(timetable, exceptions, assignments, courses)
     busy = engine.who_is_free(
@@ -378,7 +405,7 @@ def assign(body: AssignIn) -> dict:
     that would create it does not happen.
     """
     with db() as conn:
-        _, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
+        _, staff, timetable, exceptions, assignments, courses = store.load_all(conn, active_term(conn))
 
         if body.staff_id not in {s.id for s in staff}:
             raise HTTPException(400, f"There is no staff member {body.staff_id}.")
@@ -485,7 +512,7 @@ async def import_preview(file: UploadFile = File(...)) -> dict:
         raise HTTPException(400, str(exc))
 
     with db() as conn:
-        _, _, timetable, _, assignments, _ = store.load_all(conn)
+        _, _, timetable, _, assignments, _ = store.load_all(conn, active_term(conn))
 
     by_id = {r.id: r for r in timetable}
     incoming = {
@@ -525,11 +552,12 @@ def import_commit(body: CommitIn) -> dict:
         raise HTTPException(400, "There is nothing to import.")
 
     with db() as conn:
+        term = active_term(conn)
         if body.mode == "append":
             for row in body.rows:
-                store.save_timetable_row(conn, row)
+                store.save_timetable_row(conn, row, term=term)
             return {"ok": True, "added": len(body.rows), "kept": 0, "dropped": []}
-        result = store.replace_timetable(conn, body.rows)
+        result = store.replace_timetable(conn, body.rows, term=active_term(conn))
 
     return {"ok": True, "added": len(body.rows), **result}
 
@@ -605,8 +633,47 @@ def put_settings(body: SettingsIn) -> dict:
 @app.put("/api/weeks")
 def put_weeks(body: WeeksIn) -> dict:
     with db() as conn:
-        store.replace_weeks(conn, body.weeks)
+        store.replace_weeks(conn, body.weeks, term=active_term(conn))
     return {"ok": True}
+
+
+@app.post("/api/weeks/generate")
+def generate_weeks(body: WeeksGenerateIn) -> dict:
+    """Build a term's calendar from when it starts, how long, and the breaks."""
+    if body.count < 1:
+        raise HTTPException(400, "A semester needs at least one teaching week.")
+    if body.count > 52:
+        raise HTTPException(400, "That is more weeks than a year has.")
+
+    try:
+        start = date.fromisoformat(body.first_monday)
+        breaks = [
+            (date.fromisoformat(b.starts), date.fromisoformat(b.ends))
+            for b in body.breaks
+        ]
+    except ValueError as exc:
+        raise HTTPException(400, f"That is not a date the tool can read: {exc}")
+
+    for first, last in breaks:
+        if last < first:
+            raise HTTPException(400, "A break ends before it starts.")
+
+    weeks = engine.build_weeks(start, body.count, breaks)
+    with db() as conn:
+        store.replace_weeks(
+            conn,
+            [
+                {
+                    "number": w.number,
+                    "starts": w.starts.isoformat(),
+                    "ends": w.ends.isoformat(),
+                    "note": w.note,
+                }
+                for w in weeks
+            ],
+            term=active_term(conn),
+        )
+    return {"ok": True, "weeks": [week_json(w) for w in weeks]}
 
 
 @app.post("/api/staff")
@@ -636,13 +703,14 @@ def del_staff(staff_id: str) -> dict:
 @app.post("/api/timetable")
 def post_timetable(body: TimetableIn) -> dict:
     with db() as conn:
-        return {"id": store.save_timetable_row(conn, body.model_dump())}
+        return {"id": store.save_timetable_row(conn, body.model_dump(), term=active_term(conn))}
 
 
 @app.put("/api/timetable/{row_id}")
 def put_timetable(row_id: int, body: TimetableIn) -> dict:
     with db() as conn:
-        store.save_timetable_row(conn, body.model_dump(), row_id=row_id)
+        store.save_timetable_row(conn, body.model_dump(), row_id=row_id,
+                                 term=active_term(conn))
     return {"ok": True}
 
 
@@ -658,7 +726,7 @@ def post_exception(body: ExceptionIn) -> dict:
     _refuse_staffed_change(body)
     with db() as conn:
         _refuse_conflicting_add(conn, body)
-        return {"id": store.save_exception(conn, body.model_dump())}
+        return {"id": store.save_exception(conn, body.model_dump(), term=active_term(conn))}
 
 
 @app.put("/api/exceptions/{row_id}")
@@ -666,7 +734,8 @@ def put_exception(row_id: int, body: ExceptionIn) -> dict:
     _refuse_staffed_change(body)
     with db() as conn:
         _refuse_conflicting_add(conn, body, row_id=row_id)
-        store.save_exception(conn, body.model_dump(), row_id=row_id)
+        store.save_exception(conn, body.model_dump(), row_id=row_id,
+                             term=active_term(conn))
     return {"ok": True}
 
 
@@ -692,7 +761,7 @@ def _refuse_conflicting_add(conn, body: ExceptionIn, row_id: int | None = None) 
     if body.action != engine.Action.ADD.value or not body.staff_id:
         return
 
-    _, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
+    _, staff, timetable, exceptions, assignments, courses = store.load_all(conn, active_term(conn))
     if body.staff_id not in {s.id for s in staff}:
         raise HTTPException(400, f"There is no staff member {body.staff_id}.")
     if not (body.day and body.start and body.end):
