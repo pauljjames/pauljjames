@@ -147,12 +147,29 @@ def blank_to_none(value):
 
 # ------------------------------------------------------------ connection
 
-def connect(path: Path | str | None = None) -> sqlite3.Connection:
+# Databases this process has already prepared. The schema is set up the first
+# time a database is opened rather than only when the application's startup hook
+# runs, because nothing about how the app is launched should be able to leave
+# requests hitting an unprepared file: a wrapper that swallows the lifespan, a
+# different server, lifespan turned off, or a second database path all did.
+_PREPARED: set[str] = set()
+
+
+def connect(path: Path | str | None = None, prepare: bool = True) -> sqlite3.Connection:
     # Resolved at call time, not import time, so tests and callers can point
     # this somewhere else.
-    conn = sqlite3.connect(path if path is not None else DB_PATH)
+    target = Path(path if path is not None else DB_PATH)
+    conn = sqlite3.connect(target)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+
+    # prepare=False is for callers building a database deliberately, such as the
+    # test that constructs one in an older shape to check the migration.
+    if prepare:
+        key = str(target.resolve())
+        if key not in _PREPARED:
+            init(conn)
+            _PREPARED.add(key)
     return conn
 
 
@@ -184,19 +201,43 @@ def _rebuild_weeks_for_terms(conn) -> None:
     SQLite will not alter a primary key, so the table is rebuilt. Nothing has a
     foreign key to weeks, so this is safe; existing rows are tagged with
     whichever term the settings say was being planned.
+
+    Both halves of an attempt that died partway are recovered from, because a
+    rebuild that cannot be retried would wedge the tool on every start from then
+    on, and one that gave up on the scratch table would strand a calendar in it.
     """
-    held = {r["name"] for r in conn.execute("PRAGMA table_info(weeks)")}
-    if "academic_year" in held:
+    tables = {
+        r["name"] for r in
+        conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    columns = {r["name"] for r in conn.execute("PRAGMA table_info(weeks)")}
+
+    if "academic_year" not in columns:
+        term = _active_term(conn)
+        # Left by an attempt that died after the rename. It is scratch, and the
+        # rename below fails while it is there.
+        conn.execute("DROP TABLE IF EXISTS weeks_before_terms")
+        conn.execute("ALTER TABLE weeks RENAME TO weeks_before_terms")
+        conn.executescript(WEEKS_SCHEMA)
+        conn.execute(
+            "INSERT INTO weeks (academic_year, semester, number, starts, ends, note, is_sample)"
+            " SELECT ?, ?, number, starts, ends, note, is_sample FROM weeks_before_terms",
+            term,
+        )
+        conn.execute("DROP TABLE weeks_before_terms")
         return
-    term = _active_term(conn)
-    conn.execute("ALTER TABLE weeks RENAME TO weeks_before_terms")
-    conn.executescript(WEEKS_SCHEMA)
-    conn.execute(
-        "INSERT INTO weeks (academic_year, semester, number, starts, ends, note, is_sample)"
-        " SELECT ?, ?, number, starts, ends, note, is_sample FROM weeks_before_terms",
-        term,
-    )
-    conn.execute("DROP TABLE weeks_before_terms")
+
+    # weeks is already the new shape. If an attempt died between the rename and
+    # the copy, the real rows are still sitting in the scratch table.
+    if "weeks_before_terms" in tables:
+        stranded = conn.execute("SELECT COUNT(*) FROM weeks").fetchone()[0] == 0
+        if stranded:
+            conn.execute(
+                "INSERT INTO weeks (academic_year, semester, number, starts, ends, note)"
+                " SELECT ?, ?, number, starts, ends, note FROM weeks_before_terms",
+                _active_term(conn),
+            )
+        conn.execute("DROP TABLE weeks_before_terms")
 
 
 def init(conn: sqlite3.Connection) -> None:

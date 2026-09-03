@@ -15,6 +15,7 @@ double booking rule real rather than advisory.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date
@@ -38,7 +39,7 @@ HERE = Path(__file__).parent
 # every load, but the routes live in this process, so an unrestarted server
 # serves a new front end against old endpoints. The front end compares this
 # against its own copy and says so rather than failing with a bare 404.
-VERSION = "2026-09-05.2"
+VERSION = "2026-09-05.3"
 
 
 def active_term(conn) -> tuple[str, str]:
@@ -882,6 +883,57 @@ def index() -> FileResponse:
 app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
 
+def options():
+    parser = argparse.ArgumentParser(
+        description="Plan who teaches an externally set timetable.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--cert", default=os.environ.get("TIMETABLE_CERT"),
+        help="TLS certificate, such as one made with mkcert."
+             " Also read from TIMETABLE_CERT.")
+    parser.add_argument(
+        "--key", default=os.environ.get("TIMETABLE_KEY"),
+        help="The certificate's private key. Also read from TIMETABLE_KEY.")
+    parser.add_argument(
+        "--db", default=os.environ.get("TIMETABLE_DB"),
+        help="Which database file to use. Defaults to timetable.db beside this"
+             " file. Also read from TIMETABLE_DB.")
+
+    args = parser.parse_args()
+    if bool(args.cert) != bool(args.key):
+        parser.error("--cert and --key go together. Give both, or neither.")
+    for name, where in (("certificate", args.cert), ("key", args.key)):
+        if where and not Path(where).is_file():
+            parser.error(f"No {name} at {where}")
+    return args
+
+
 if __name__ == "__main__":
-    print("\n  Timetable staffing running at http://127.0.0.1:8000\n")
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+    import argparse
+
+    args = options()
+    if args.db:
+        store.DB_PATH = Path(args.db)
+
+    # Prepared here as well as on first use, so a database that cannot be set up
+    # says so once, in a sentence, rather than as a traceback on every request.
+    try:
+        with db() as conn:
+            store.init(conn)
+    except Exception as exc:
+        raise SystemExit(
+            f"\n  Cannot prepare the database at {store.DB_PATH}.\n  {exc}\n")
+
+    scheme = "https" if args.cert else "http"
+    print(f"\n  Timetable staffing running at {scheme}://{args.host}:{args.port}")
+    print(f"  Reading {store.DB_PATH}")
+    if args.cert:
+        print("\n  Serving HTTPS. Opening the http:// address by mistake logs")
+        print("  'Invalid HTTP request received' and nothing will load.")
+    print()
+
+    uvicorn.run(
+        app, host=args.host, port=args.port, log_level="warning",
+        ssl_certfile=args.cert, ssl_keyfile=args.key,
+    )

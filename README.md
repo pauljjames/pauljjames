@@ -24,6 +24,36 @@ python app.py
 
 Then open <http://127.0.0.1:8000>.
 
+### Over HTTPS
+
+Point it at a certificate and it serves TLS instead. A local one from
+[mkcert](https://github.com/FiloSottile/mkcert) works:
+
+```
+mkcert localhost 127.0.0.1
+python app.py --cert localhost+1.pem --key localhost+1-key.pem
+```
+
+`TIMETABLE_CERT` and `TIMETABLE_KEY` do the same thing if you would rather not
+type them, and `--host`, `--port` and `--db` are there too. Give both `--cert`
+and `--key` or neither; either alone stops with a message rather than starting
+half configured.
+
+If the log fills with `Invalid HTTP request received` and nothing loads, a
+browser is speaking plain HTTP to the HTTPS port. Use the `https://` address the
+banner prints. `ConnectionResetError` alongside it is the same thing seen from
+the other end, and is harmless.
+
+### Which database
+
+`timetable.db` beside `app.py`, unless `--db` or `TIMETABLE_DB` says otherwise.
+The banner prints the file it is reading, so there is never a question of which
+one is in play.
+
+The schema is prepared when the database is first opened, not only at startup,
+so however the app is launched -- a wrapper, a different server, an editor's run
+button -- it cannot end up serving requests against a database it never set up.
+
 The database is a single file, `timetable.db`, created next to `app.py` on
 first run and loaded with sample data. Setup can take that sample out again, or
 clear the lot. Deleting the file starts over.
@@ -312,7 +342,7 @@ from the class it sits beside rather than the same thing counted twice.
 python -m pytest
 ```
 
-197 tests. The engine cases came from two real course outlines: a lecture
+202 tests. The engine cases came from two real course outlines: a lecture
 running in three weeks only, workshops shortened in those weeks so the lecturer
 is not double booked, a public holiday cancellation, a one week substitution,
 split semester teaching, and an added crit session.
@@ -350,6 +380,19 @@ Two more are guards rather than features. One removes the exceptions and
 asserts that the clash reappears, so the shortened workshop test cannot pass by
 accident if clash detection stops working. The other checks that when a section
 appears twice in a week, only the class that actually collides is flagged.
+
+## When it will not start
+
+The database is prepared on first use and again at startup, and both paths are
+idempotent, so the usual fix is simply to run it again.
+
+A database left half migrated by an interrupted upgrade repairs itself on the
+next start, in both directions: a rename that had already happened is finished,
+and a calendar stranded in the scratch table is taken back. Nothing holding your
+rows is ever dropped.
+
+If the database genuinely cannot be prepared, the app stops with one sentence
+naming the file and the problem instead of a traceback on every request.
 
 ## Updating
 

@@ -814,7 +814,7 @@ def test_two_terms_hold_separate_calendars_without_colliding(conn):
 
 def test_a_database_from_before_terms_keeps_everything(tmp_path):
     """The migration rebuilds weeks and tags rows with the term in settings."""
-    old = store.connect(tmp_path / "old.db")
+    old = store.connect(tmp_path / "old.db", prepare=False)
     old.executescript("""
         CREATE TABLE weeks (
             number INTEGER PRIMARY KEY, starts TEXT NOT NULL,
@@ -961,3 +961,95 @@ def test_the_export_carries_who_teaches_without_letting_it_back_in(client):
     parsed, _ = importer.parse("export.xlsx", client.get("/api/timetable/export.xlsx").content)
     assert all(set(row) == {"course_code", "section", "day", "start", "end", "weeks"}
                for row in parsed)
+
+
+# ------------------------------------------------------------ starting up
+
+def test_requests_work_even_if_startup_never_ran(tmp_path, monkeypatch):
+    """The bug this guards: every request died with 'no such table: settings'.
+
+    init() used to run in one place only, the application's startup hook. If
+    that did not fire -- a wrapper that swallows the lifespan, a different
+    server, lifespan turned off -- the app served every request against a
+    database that had never been set up. Opening the database prepares it, so
+    how the app is launched cannot break it.
+    """
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "never-started.db")
+    store._PREPARED.clear()
+
+    import app as app_module
+    importlib.reload(app_module)
+
+    # No TestClient context manager, so the lifespan is never run.
+    reply = TestClient(app_module.app).get("/api/state")
+    assert reply.status_code == 200
+    assert reply.json()["settings"] == {"academic_year": "", "semester": ""}
+
+
+def test_opening_a_database_prepares_it(tmp_path):
+    store._PREPARED.clear()
+    conn = store.connect(tmp_path / "fresh.db")
+    assert store.get_settings(conn) == {}          # rather than raising
+    assert store.get_courses(conn) == []
+    conn.close()
+
+
+def test_a_database_is_only_prepared_once_per_process(tmp_path):
+    store._PREPARED.clear()
+    path = tmp_path / "twice.db"
+    store.connect(path).close()
+
+    calls = []
+    real = store.init
+    store.init = lambda conn: calls.append(1) or real(conn)
+    try:
+        store.connect(path).close()
+        store.connect(path).close()
+    finally:
+        store.init = real
+    assert calls == []                              # already prepared
+
+
+def test_a_rebuild_that_died_partway_recovers(tmp_path):
+    """It used to wedge: every later start hit the leftover scratch table."""
+    path = tmp_path / "half.db"
+    conn = store.connect(path, prepare=False)
+    conn.executescript("""
+        CREATE TABLE weeks (number INTEGER PRIMARY KEY, starts TEXT NOT NULL,
+                            ends TEXT NOT NULL, note TEXT NOT NULL DEFAULT '');
+        CREATE TABLE weeks_before_terms (number INTEGER PRIMARY KEY,
+                            starts TEXT, ends TEXT, note TEXT);
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+        INSERT INTO weeks VALUES (1, '2027-07-26', '2027-08-01', 'kept');
+        INSERT INTO settings VALUES ('academic_year', '2027'), ('semester', 'S2FS');
+    """)
+    conn.commit()
+
+    store.init(conn)                                 # used to raise
+
+    weeks = store.get_weeks(conn, ("2027", "S2FS"))
+    assert [w.note for w in weeks] == ["kept"]       # the real row survived
+    left = {r["name"] for r in
+            conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert "weeks_before_terms" not in left
+    conn.close()
+
+
+def test_a_calendar_stranded_in_the_scratch_table_is_taken_back(tmp_path):
+    """The other half: it died after the rename, before the copy."""
+    path = tmp_path / "stranded.db"
+    conn = store.connect(path, prepare=False)
+    conn.executescript("""
+        CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+        CREATE TABLE weeks_before_terms (number INTEGER PRIMARY KEY,
+                            starts TEXT, ends TEXT, note TEXT);
+        INSERT INTO settings VALUES ('academic_year', '2027'), ('semester', 'S2FS');
+        INSERT INTO weeks_before_terms VALUES (1, '2027-07-26', '2027-08-01', 'stranded');
+    """)
+    conn.commit()
+
+    store.init(conn)
+
+    weeks = store.get_weeks(conn, ("2027", "S2FS"))
+    assert [w.note for w in weeks] == ["stranded"]   # not lost in the scratch table
+    conn.close()
