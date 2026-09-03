@@ -3,7 +3,7 @@
 // Kept in step with VERSION in app.py. The browser reads this file fresh on
 // every load but the routes live in the running server, so a new front end can
 // meet an old one. This is what lets the page say so.
-const APP_VERSION = "2026-09-03.1";
+const APP_VERSION = "2026-09-03.2";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
               "Saturday", "Sunday"];
@@ -1021,9 +1021,9 @@ function coursesView() {
 
   panel.append(el("p", { class: "hint" },
     "Everything the student management system knows about these offerings. It is ",
-    "a catalogue, not a plan: most of it is accountability rather than teaching, ",
-    "and nobody here is read as staff. What the rest of the tool takes from it is ",
-    "the code and the name a class is known by."));
+    "a catalogue, not a plan. A coordinator is accountable for a course; they are ",
+    "not the person in the room, and nothing here is ever read as staff. Who ",
+    "teaches comes from the Planner, and is the Teaching column."));
 
   if (!state.courses.length) {
     panel.append(el("p", { class: "empty", text: "No courses yet. Import an export above." }));
@@ -1077,7 +1077,7 @@ function coursesView() {
         el("th", { text: "Code" }), el("th", { text: "Name" }),
         el("th", { text: "Year" }), el("th", { text: "Sem" }),
         el("th", { text: "Occ" }), el("th", { text: "Coordinator" }),
-        el("th", { text: "Timetabled" }))));
+        el("th", { text: "Teaching" }))));
 
     const body = el("tbody");
     for (const c of matches.slice(0, COURSE_PAGE)) {
@@ -1092,10 +1092,7 @@ function coursesView() {
           c.coordinator_email
             ? el("div", { class: "muted", text: c.coordinator_email })
             : null),
-        el("td", {},
-          timetabled.has(c.code)
-            ? el("span", { class: "flag", text: "in the timetable" })
-            : el("span", { class: "muted", text: "—" }))));
+        el("td", {}, teachingCell(c, timetabled))));
     }
     table.append(body);
 
@@ -1111,6 +1108,21 @@ function coursesView() {
   renderCourseTable();
   return wrap;
 }
+
+/** Who teaches a course, which is never who coordinates it. */
+function teachingCell(course, timetabled) {
+  const who = (state.teaching || {})[course.code] || [];
+  if (who.length) {
+    return el("div", { class: "chips" }, who.map((id) =>
+      el("span", { class: "chip" },
+        el("span", { class: "swatch", style: `background:${personColour(id)}` }),
+        staffName(id))));
+  }
+  return timetabled.has(course.code)
+    ? el("span", { class: "flag warn", text: "nobody yet" })
+    : el("span", { class: "muted", text: "not timetabled" });
+}
+
 
 function coursesImportPanel() {
   const panel = el("section", { class: "panel" },
@@ -1170,19 +1182,35 @@ function coursesImportPanel() {
       panel.append(el("p", { class: "muted", text: `and ${rows.length - 20} more.` }));
     }
 
+    const covers = (coursePreview.offerings || [])
+      .map((o) => `${o.semester} ${o.academic_year}`.trim())
+      .filter(Boolean);
+
     panel.append(el("div", { class: "toolbar" },
       el("button", {
         class: "action primary", text: "Add these to the catalogue",
         onclick: () => commitCourses("merge"),
       }),
+      covers.length
+        ? el("button", {
+            class: "action",
+            text: `Replace ${covers.join(" and ")}`,
+            onclick: () => commitCourses("replace_offering"),
+          })
+        : null,
       el("button", {
         class: "action", text: "Replace the whole catalogue",
-        onclick: () => commitCourses("replace"),
+        onclick: () => commitCourses("replace_all"),
       }),
       el("button", {
         class: "link", text: "Cancel",
         onclick: () => { coursePreview = null; render(); },
       })));
+
+    panel.append(el("p", { class: "hint" },
+      "Adding updates what matches and leaves the rest, so importing the same ",
+      "export twice changes nothing. Replacing a semester refreshes just that ",
+      "one, so a course that has gone from it goes here too."));
   }
 
   return panel;
@@ -1203,12 +1231,22 @@ async function previewCourses(file) {
 }
 
 async function commitCourses(mode) {
-  if (mode === "replace") {
+  if (mode === "replace_all") {
     const ok = await confirmDialog(
       "Replace the whole catalogue?",
-      `The ${coursePreview.holding} courses held now will be deleted and replaced by ` +
-      `${coursePreview.rows.length} from the file. An export is often one semester, ` +
-      `so anything not in this file goes.`);
+      `All ${coursePreview.holding} courses held now will be deleted and replaced ` +
+      `by the ${coursePreview.rows.length} in this file, including courses in ` +
+      `semesters the file does not cover.`);
+    if (!ok) return;
+  }
+  if (mode === "replace_offering") {
+    const covers = (coursePreview.offerings || [])
+      .map((o) => `${o.semester} ${o.academic_year}`.trim()).join(" and ");
+    const ok = await confirmDialog(
+      `Replace ${covers}?`,
+      `The ${coursePreview.offering_holds} courses held for ${covers} will be ` +
+      `replaced by the ${coursePreview.rows.length} in this file. Other semesters ` +
+      `are left alone.`);
     if (!ok) return;
   }
   try {
@@ -1313,19 +1351,37 @@ function setupView() {
   wrap.append(el("section", { class: "panel" },
     el("h2", { text: "Sample data" }),
     el("p", { class: "hint" },
-      "The sample timetable shows the states this tool distinguishes: a split ",
-      "semester, a section nobody covers, a cancelled week and an added class."),
+      "The sample holds five real courses with an invented timetable and ",
+      "invented staff, shaped to show the states this tool distinguishes: a ",
+      "split semester, a section nobody covers, a cancelled week and an added ",
+      "class. Removing it leaves anything you have imported or typed."),
     el("div", { class: "toolbar" },
-      el("button", {
-        class: "action", text: "Reload the sample data",
-        onclick: () => confirmThen(
-          "Replace everything with the sample data?",
-          () => api("POST", "/api/sample-data"), "Sample data loaded."),
-      }),
+      state.has_sample
+        ? el("button", {
+            class: "action", text: "Remove the sample data",
+            onclick: () => confirmThen(
+              "Remove the sample data? Anything you have imported or typed stays.",
+              () => api("DELETE", "/api/sample-data"), "Sample data removed."),
+          })
+        : el("button", {
+            class: "action", text: "Load the sample data",
+            onclick: () => confirmThen(
+              "Replace everything with the sample data?",
+              () => api("POST", "/api/sample-data"), "Sample data loaded."),
+          }),
+      state.has_sample
+        ? el("button", {
+            class: "link", text: "Reload it",
+            onclick: () => confirmThen(
+              "Replace everything with a fresh copy of the sample data?",
+              () => api("POST", "/api/sample-data"), "Sample data reloaded."),
+          })
+        : null,
+      el("span", { class: "spacer" }),
       el("button", {
         class: "link danger", text: "Clear everything",
         onclick: () => confirmThen(
-          "Delete all staff, timetable, staffing and exceptions?",
+          "Delete everything: courses, staff, timetable, staffing and exceptions?",
           () => api("DELETE", "/api/all-data"), "Everything cleared."),
       }))));
 

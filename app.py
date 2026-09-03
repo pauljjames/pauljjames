@@ -36,7 +36,7 @@ HERE = Path(__file__).parent
 # every load, but the routes live in this process, so an unrestarted server
 # serves a new front end against old endpoints. The front end compares this
 # against its own copy and says so rather than failing with a bare 404.
-VERSION = "2026-09-03.1"
+VERSION = "2026-09-03.2"
 
 
 @contextmanager
@@ -52,7 +52,7 @@ def db():
 async def lifespan(_: FastAPI):
     with db() as conn:
         store.init(conn)
-        if store.is_empty(conn):
+        if store.is_new(conn):
             seed.load(conn)
     yield
 
@@ -121,7 +121,7 @@ class CommitIn(BaseModel):
 
 class CourseCommitIn(BaseModel):
     rows: list[dict]
-    mode: str = "merge"          # merge updates in place; replace wipes first
+    mode: str = "merge"          # merge | replace_offering | replace_all
 
 
 class SettingsIn(BaseModel):
@@ -259,6 +259,7 @@ def state() -> dict:
     with db() as conn:
         weeks, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
         settings = store.get_settings(conn)
+        has_sample = store.has_sample(conn)
 
     classes = engine.expand(timetable, exceptions, assignments, courses)
     cover = engine.coverage(classes)
@@ -314,6 +315,8 @@ def state() -> dict:
             for p in problems
         ],
         "courses": [course_json(c) for c in courses],
+        "teaching": engine.teachers_for(classes),
+        "has_sample": has_sample,
         "settings": {
             "academic_year": settings.get("academic_year", ""),
             "semester": settings.get("semester", ""),
@@ -546,6 +549,13 @@ async def course_preview(file: UploadFile = File(...)) -> dict:
     incoming = [
         (r["code"], r["academic_year"], r["semester"], r["occurrence"]) for r in rows
     ]
+    offerings = store.offerings_in(rows)
+    with db() as conn:
+        held = store.get_courses(conn)
+    in_those_offerings = [
+        c for c in held if (c.academic_year, c.semester) in set(offerings)
+    ]
+
     return {
         "rows": rows,
         "issues": issues,
@@ -553,6 +563,12 @@ async def course_preview(file: UploadFile = File(...)) -> dict:
         "new": sum(1 for key in incoming if key not in existing),
         "updating": sum(1 for key in incoming if key in existing),
         "semesters": sorted({r["semester"] for r in rows if r["semester"]}),
+        "offerings": [
+            {"academic_year": year, "semester": semester}
+            for year, semester in offerings
+        ],
+        # what "replace just these semesters" would drop
+        "offering_holds": len(in_those_offerings),
     }
 
 
@@ -561,8 +577,10 @@ def course_commit(body: CourseCommitIn) -> dict:
     """Write catalogue rows. Merging updates in place; replacing wipes first."""
     if not body.rows:
         raise HTTPException(400, "There is nothing to import.")
+    if body.mode not in ("merge", "replace_offering", "replace_all"):
+        raise HTTPException(400, f"There is no import mode {body.mode!r}.")
     with db() as conn:
-        result = store.save_courses(conn, body.rows, replace=body.mode == "replace")
+        result = store.save_courses(conn, body.rows, mode=body.mode)
     return {"ok": True, **result}
 
 
@@ -711,6 +729,14 @@ def reload_sample() -> dict:
         seed.clear(conn)
         seed.load(conn)
     return {"ok": True}
+
+
+@app.delete("/api/sample-data")
+def remove_sample() -> dict:
+    """Take out what the app invented, leaving anything imported or typed."""
+    with db() as conn:
+        removed = store.remove_sample(conn)
+    return {"ok": True, "removed": removed}
 
 
 @app.delete("/api/all-data")

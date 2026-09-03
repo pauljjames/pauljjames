@@ -23,14 +23,16 @@ CREATE TABLE IF NOT EXISTS weeks (
     number  INTEGER PRIMARY KEY,
     starts  TEXT NOT NULL,
     ends    TEXT NOT NULL,
-    note    TEXT NOT NULL DEFAULT ''
+    note    TEXT NOT NULL DEFAULT '',
+    is_sample  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS staff (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
     email           TEXT NOT NULL DEFAULT '',
-    target_minutes  INTEGER
+    target_minutes  INTEGER,
+    is_sample  INTEGER NOT NULL DEFAULT 0
 );
 
 -- The catalogue, as exported from the student management system. Identity is
@@ -50,6 +52,7 @@ CREATE TABLE IF NOT EXISTS courses (
     grade_reviewer              TEXT NOT NULL DEFAULT '',
     grade_reviewer_email        TEXT NOT NULL DEFAULT '',
     department                  TEXT NOT NULL DEFAULT '',
+    is_sample                   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (code, academic_year, semester, occurrence)
 );
 
@@ -97,7 +100,8 @@ CREATE TABLE IF NOT EXISTS exceptions (
     start         TEXT,
     end           TEXT,
     staff_id      TEXT,
-    note          TEXT NOT NULL DEFAULT ''
+    note          TEXT NOT NULL DEFAULT '',
+    is_sample     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS ix_courses_code ON courses (code);
@@ -139,13 +143,88 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
+# Set once the database has been through setup, so a database somebody has
+# deliberately emptied is not helpfully refilled with sample data on the next run.
+SETUP_MARKER = "initialised"
+
+SAMPLE_TABLES = ("weeks", "staff", "courses", "timetable", "exceptions")
+
+
+def _add_column_if_missing(conn, table: str, column: str, declaration: str) -> None:
+    """The schema is CREATE TABLE IF NOT EXISTS, so it never alters what exists."""
+    held = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in held:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
 def init(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    for table in SAMPLE_TABLES:
+        _add_column_if_missing(conn, table, "is_sample", "INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 
-def is_empty(conn: sqlite3.Connection) -> bool:
-    return conn.execute("SELECT COUNT(*) FROM timetable").fetchone()[0] == 0
+def is_new(conn: sqlite3.Connection) -> bool:
+    """Has this database never been set up?
+
+    Not "is the timetable empty": somebody who has cleared the sample data, or
+    imported a catalogue before entering any timetable, has an empty timetable
+    and does not want it refilled.
+    """
+    if conn.execute("SELECT 1 FROM settings WHERE key = ?", (SETUP_MARKER,)).fetchone():
+        return False
+    held = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM weeks) + (SELECT COUNT(*) FROM staff)"
+        " + (SELECT COUNT(*) FROM courses) + (SELECT COUNT(*) FROM timetable)"
+    ).fetchone()[0]
+    return held == 0
+
+
+def mark_setup_done(conn) -> None:
+    set_settings(conn, {SETUP_MARKER: "1"})
+
+
+def has_sample(conn) -> bool:
+    return any(
+        conn.execute(f"SELECT 1 FROM {table} WHERE is_sample = 1 LIMIT 1").fetchone()
+        for table in SAMPLE_TABLES
+    )
+
+
+def mark_all_as_sample(conn) -> None:
+    """Everything currently held was put there by seed.load, which runs on a
+    cleared database. Anything written afterwards clears its own flag."""
+    with conn:
+        for table in SAMPLE_TABLES:
+            conn.execute(f"UPDATE {table} SET is_sample = 1")
+
+
+def remove_sample(conn) -> dict:
+    """Take out what the app invented, and leave everything else standing."""
+    removed = {}
+    with conn:
+        conn.execute(
+            "DELETE FROM assignments WHERE timetable_id IN"
+            " (SELECT id FROM timetable WHERE is_sample = 1)"
+        )
+        conn.execute(
+            "DELETE FROM timetable_weeks WHERE timetable_id IN"
+            " (SELECT id FROM timetable WHERE is_sample = 1)"
+        )
+        for table in ("exceptions", "timetable", "courses", "staff", "weeks"):
+            cur = conn.execute(f"DELETE FROM {table} WHERE is_sample = 1")
+            removed[table] = max(cur.rowcount, 0)
+
+        # The offering being planned came with the sample, so it goes with it,
+        # unless it has since been changed to something the user chose.
+        settings = get_settings(conn)
+        planned = settings.get("sample_planning", "")
+        if planned and planned == f"{settings.get('academic_year', '')}|{settings.get('semester', '')}":
+            conn.execute(
+                "UPDATE settings SET value = '' WHERE key IN ('academic_year', 'semester')"
+            )
+        conn.execute("DELETE FROM settings WHERE key = 'sample_planning'")
+    return removed
 
 
 # ------------------------------------------------------------ reading
@@ -278,8 +357,8 @@ def save_staff(conn, row: dict, original_id: str | None = None) -> str:
     with conn:
         if original_id:
             conn.execute(
-                "UPDATE staff SET id = ?, name = ?, email = ?, target_minutes = ?"
-                " WHERE id = ?",
+                "UPDATE staff SET id = ?, name = ?, email = ?, target_minutes = ?,"
+                " is_sample = 0 WHERE id = ?",
                 (row["id"], row["name"], row.get("email") or "", target, original_id),
             )
             # assignments follow the rename through ON UPDATE CASCADE; added
@@ -339,7 +418,7 @@ def save_timetable_row(conn, row: dict, row_id: int | None = None) -> int:
         else:
             conn.execute(
                 "UPDATE timetable SET course_code = ?, section = ?,"
-                " day = ?, start = ?, end = ? WHERE id = ?",
+                " day = ?, start = ?, end = ?, is_sample = 0 WHERE id = ?",
                 values + (row_id,),
             )
             # A week the class no longer runs in cannot stay staffed.
@@ -414,7 +493,8 @@ def save_exception(conn, row: dict, row_id: int | None = None) -> int:
             return cur.lastrowid
         conn.execute(
             "UPDATE exceptions SET week = ?, course_code = ?, section = ?, action = ?,"
-            " day = ?, start = ?, end = ?, staff_id = ?, note = ? WHERE id = ?",
+            " day = ?, start = ?, end = ?, staff_id = ?, note = ?, is_sample = 0"
+            " WHERE id = ?",
             values + (row_id,),
         )
     return row_id
@@ -427,26 +507,45 @@ def delete_exception(conn, row_id: int) -> None:
 
 # ------------------------------------------------------------ courses
 
-def save_courses(conn, rows: list[dict], replace: bool = False) -> dict:
+def offerings_in(rows: list[dict]) -> list[tuple[str, str]]:
+    """The (year, semester) pairs a file covers."""
+    return sorted({
+        (str(r.get("academic_year") or ""), str(r.get("semester") or ""))
+        for r in rows
+    })
+
+
+def save_courses(conn, rows: list[dict], mode: str = "merge") -> dict:
     """Write catalogue rows, keyed on the whole offering.
 
-    Re-importing the same export is not meant to double it up, so a row that
-    already exists is overwritten rather than added beside itself. Replacing is
-    the deliberate, destructive version and has to be asked for: an export is
-    often one semester, and wiping the other one silently would be wrong.
+    Three ways, because an export is usually one semester of a bigger catalogue:
+
+      merge             update what matches, add the rest, touch nothing else.
+                        Importing the same export twice changes nothing.
+      replace_offering  refresh only the semesters the file covers, so a course
+                        dropped from S2FS goes, and S1FS is left alone.
+      replace_all       the deliberate, destructive one.
+
+    An imported row is the user's, never sample data, whatever it replaced.
     """
     before = {c.key for c in get_courses(conn)}
+    columns = COURSE_FIELDS + ("is_sample",)
     values = [
-        tuple(str(row.get(field) or "") for field in COURSE_FIELDS)
+        tuple(str(row.get(field) or "") for field in COURSE_FIELDS) + (0,)
         for row in rows
     ]
-    placeholders = ", ".join("?" * len(COURSE_FIELDS))
+    placeholders = ", ".join("?" * len(columns))
 
     with conn:
-        if replace:
+        if mode == "replace_all":
             conn.execute("DELETE FROM courses")
+        elif mode == "replace_offering":
+            conn.executemany(
+                "DELETE FROM courses WHERE academic_year = ? AND semester = ?",
+                offerings_in(rows),
+            )
         conn.executemany(
-            f"INSERT OR REPLACE INTO courses ({', '.join(COURSE_FIELDS)})"
+            f"INSERT OR REPLACE INTO courses ({', '.join(columns)})"
             f" VALUES ({placeholders})",
             values,
         )

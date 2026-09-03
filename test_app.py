@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import engine
+import importer
 import seed
 import store
 
@@ -98,7 +99,7 @@ def test_deleting_a_person_leaves_their_classes_uncovered_not_missing(conn):
     _, _, timetable, exceptions, assignments, courses = store.load_all(conn)
     assert all(a.staff_id != "ahern" for a in assignments)
     classes = engine.expand(timetable, exceptions, assignments, courses)
-    assert any(c.label == "111.701 A" and not c.covered for c in classes)
+    assert any(c.label == "133150 SHOW-A" and not c.covered for c in classes)
 
 
 def test_renaming_a_person_carries_their_assignments(conn):
@@ -127,7 +128,7 @@ def test_state_reports_coverage_and_staffing(client):
 def test_state_groups_a_split_semester_into_spans(client):
     spans = [
         a for a in client.get("/api/state").json()["assignments"]
-        if a["timetable_id"] == row_id(client, "222.702", "WS-C")
+        if a["timetable_id"] == row_id(client, "133168", "STU-A")
     ]
     assert len(spans) == 2
     assert {tuple(s["weeks"]) for s in spans} == {
@@ -144,7 +145,7 @@ def test_state_says_who_is_over_their_target(client):
 # ------------------------------------------------------------ assigning
 
 def test_assigning_a_free_person_works(client):
-    target = row_id(client, "111.701", "D")
+    target = row_id(client, "133150", "SHOW-D")
     reply = client.post("/api/assign", json={
         "timetable_id": target, "staff_id": "dalzell", "weeks": [1, 2, 3],
     })
@@ -158,14 +159,14 @@ def test_assigning_a_free_person_works(client):
 
 def test_assigning_somebody_who_is_busy_is_refused(client):
     """The whole point: the write that would create a clash does not happen."""
-    target = row_id(client, "111.701", "D")
+    target = row_id(client, "133150", "SHOW-D")
     reply = client.post("/api/assign", json={
         "timetable_id": target, "staff_id": "ahern", "weeks": [1, 2],
     })
     assert reply.status_code == 409
     detail = reply.json()["detail"]
     assert detail["error"] == "double_booked"
-    assert "111.701 A" in detail["message"]
+    assert "133150 SHOW-A" in detail["message"]
     assert {c["week"] for c in detail["conflicts"]} == {1, 2}
 
     after = client.get("/api/state").json()
@@ -178,19 +179,19 @@ def test_assigning_somebody_who_is_busy_is_refused(client):
 
 
 def test_a_refusal_names_the_class_in_the_way(client):
-    target = row_id(client, "111.701", "D")
+    target = row_id(client, "133150", "SHOW-D")
     detail = client.post("/api/assign", json={
         "timetable_id": target, "staff_id": "brill", "weeks": [4],
     }).json()["detail"]
     conflict = detail["conflicts"][0]
-    assert conflict["existing"]["label"] == "111.701 B"
-    assert conflict["proposed"]["label"] == "111.701 D"
+    assert conflict["existing"]["label"] == "133150 SHOW-B"
+    assert conflict["proposed"]["label"] == "133150 SHOW-D"
     assert conflict["existing"]["start"] == "14:00"
 
 
 def test_a_class_can_be_split_between_two_people(client):
     """Half a semester each, which is two sets of weeks rather than two rows."""
-    target = row_id(client, "111.701", "D")
+    target = row_id(client, "133150", "SHOW-D")
     assert client.post("/api/assign", json={
         "timetable_id": target, "staff_id": "dalzell", "weeks": list(range(1, 7)),
     }).status_code == 200
@@ -209,8 +210,8 @@ def test_a_class_can_be_split_between_two_people(client):
 
 
 def test_taking_a_class_off_somebody_frees_them_for_it(client):
-    target = row_id(client, "111.701", "D")
-    held = row_id(client, "111.701", "A")
+    target = row_id(client, "133150", "SHOW-D")
+    held = row_id(client, "133150", "SHOW-A")
 
     assert client.post("/api/assign", json={
         "timetable_id": target, "staff_id": "ahern", "weeks": [1],
@@ -224,7 +225,7 @@ def test_taking_a_class_off_somebody_frees_them_for_it(client):
 
 
 def test_taking_over_weeks_somebody_else_holds_needs_saying_so(client):
-    target = row_id(client, "111.701", "A")
+    target = row_id(client, "133150", "SHOW-A")
     first = client.post("/api/assign", json={
         "timetable_id": target, "staff_id": "dalzell", "weeks": [1, 2],
     })
@@ -242,7 +243,7 @@ def test_taking_over_weeks_somebody_else_holds_needs_saying_so(client):
 
 
 def test_extending_somebodys_own_class_is_not_a_takeover(client):
-    target = row_id(client, "222.702", "WS-C")
+    target = row_id(client, "133168", "STU-A")
     reply = client.post("/api/assign", json={
         "timetable_id": target, "staff_id": "chen", "weeks": [1, 2, 3],
     })
@@ -250,7 +251,7 @@ def test_extending_somebodys_own_class_is_not_a_takeover(client):
 
 
 def test_assigning_a_week_the_class_does_not_run_is_refused(client):
-    target = row_id(client, "222.702", "LEC")     # weeks 7, 8, 9 only
+    target = row_id(client, "133154", "LEC")     # weeks 7, 8, 9 only
     reply = client.post("/api/assign", json={
         "timetable_id": target, "staff_id": "chen", "weeks": [1],
     })
@@ -260,13 +261,13 @@ def test_assigning_a_week_the_class_does_not_run_is_refused(client):
 
 def test_assigning_a_person_who_does_not_exist_is_refused(client):
     reply = client.post("/api/assign", json={
-        "timetable_id": row_id(client, "111.701", "D"), "staff_id": "ghost",
+        "timetable_id": row_id(client, "133150", "SHOW-D"), "staff_id": "ghost",
     })
     assert reply.status_code == 400
 
 
 def test_assigning_with_no_weeks_given_covers_the_whole_run(client):
-    target = row_id(client, "111.701", "D")
+    target = row_id(client, "133150", "SHOW-D")
     reply = client.post("/api/assign", json={
         "timetable_id": target, "staff_id": "dalzell",
     })
@@ -276,10 +277,10 @@ def test_assigning_with_no_weeks_given_covers_the_whole_run(client):
 
 
 def test_unassigning_puts_a_class_back_in_the_needs_somebody_list(client):
-    target = row_id(client, "111.701", "A")
+    target = row_id(client, "133150", "SHOW-A")
     client.post("/api/unassign", json={"timetable_id": target, "weeks": [5]})
     rows = client.get("/api/state").json()["coverage"]["rows"]
-    assert any(r["section"] == "A" and r["weeks"] == [5] for r in rows)
+    assert any(r["section"] == "SHOW-A" and r["weeks"] == [5] for r in rows)
 
 
 # ------------------------------------------------------------ availability
@@ -288,7 +289,7 @@ def test_availability_marks_the_busy_before_anyone_is_offered(client):
     people = client.post("/api/availability", json={
         "day": "Tuesday", "start": "14:00", "end": "17:00",
         "weeks": list(range(1, 13)),
-        "timetable_id": row_id(client, "111.701", "D"),
+        "timetable_id": row_id(client, "133150", "SHOW-D"),
     }).json()["staff"]
 
     by_id = {p["id"]: p for p in people}
@@ -302,7 +303,7 @@ def test_availability_marks_the_busy_before_anyone_is_offered(client):
 
 def test_an_exception_cannot_carry_staff(client):
     reply = client.post("/api/exceptions", json={
-        "week": 3, "course_code": "111.701", "section": "A",
+        "week": 3, "course_code": "133150", "section": "SHOW-A",
         "action": "Change", "staff_id": "brill",
     })
     assert reply.status_code == 400
@@ -311,7 +312,7 @@ def test_an_exception_cannot_carry_staff(client):
 
 def test_an_added_class_that_double_books_somebody_is_refused(client):
     reply = client.post("/api/exceptions", json={
-        "week": 3, "course_code": "111.701", "section": "A", "action": "Add",
+        "week": 3, "course_code": "133150", "section": "SHOW-A", "action": "Add",
         "day": "Tuesday", "start": "15:00", "end": "16:00", "staff_id": "ahern",
     })
     assert reply.status_code == 409
@@ -320,7 +321,7 @@ def test_an_added_class_that_double_books_somebody_is_refused(client):
 
 def test_an_added_class_in_a_free_slot_is_allowed(client):
     reply = client.post("/api/exceptions", json={
-        "week": 3, "course_code": "111.701", "section": "A", "action": "Add",
+        "week": 3, "course_code": "133150", "section": "SHOW-A", "action": "Add",
         "day": "Friday", "start": "15:00", "end": "16:00", "staff_id": "ahern",
     })
     assert reply.status_code == 200
@@ -330,7 +331,7 @@ def test_an_added_class_in_a_free_slot_is_allowed(client):
 def test_cancelling_a_week_leaves_it_needing_nobody(client):
     before = client.get("/api/state").json()["coverage"]["total"]
     client.post("/api/exceptions", json={
-        "week": 4, "course_code": "111.701", "section": "D", "action": "Cancel",
+        "week": 4, "course_code": "133150", "section": "SHOW-D", "action": "Cancel",
     })
     assert client.get("/api/state").json()["coverage"]["total"] == before - 1
 
@@ -338,9 +339,9 @@ def test_cancelling_a_week_leaves_it_needing_nobody(client):
 # ------------------------------------------------------------ import
 
 CSV = (
-    b"Course Code,Course Title,Section,Day,Start,End,Weeks\n"
-    b"111.701,Design Studio,A,Tuesday,14:00,17:00,1-12\n"
-    b"999.999,New Course,X,Friday,9:00,11:00,\"1-4, 6\"\n"
+    b"Course Code,Section,Day,Start,End,Weeks\n"
+    b"133150,SHOW-A,Tuesday,14:00,17:00,1-12\n"
+    b"999999,X,Friday,9:00,11:00,\"1-4, 6\"\n"
 )
 
 
@@ -353,7 +354,7 @@ def test_import_preview_writes_nothing(client):
     assert len(preview["rows"]) == 2
     assert preview["issues"] == []
     assert preview["replacing"] == len(before["timetable"])
-    assert any(d["course_code"] == "222.702" for d in preview["would_drop"])
+    assert any(d["course_code"] == "133154" for d in preview["would_drop"])
     assert client.get("/api/state").json()["timetable"] == before["timetable"]
 
 
@@ -366,20 +367,20 @@ def test_import_keeps_the_staffing_that_still_fits(client):
     ).json()
 
     assert result["added"] == 2
-    assert result["kept"] == 12          # 111.701 A survives, week for week
+    assert result["kept"] == 12          # 133150 SHOW-A survives, week for week
     assert result["dropped"]
 
     after = client.get("/api/state").json()
-    assert {r["course_code"] for r in after["timetable"]} == {"111.701", "999.999"}
-    kept = [c for c in after["classes"] if c["label"] == "111.701 A"]
+    assert {r["course_code"] for r in after["timetable"]} == {"133150", "999999"}
+    kept = [c for c in after["classes"] if c["label"] == "133150 SHOW-A"]
     assert {c["staff_id"] for c in kept} == {"ahern"}
 
 
 def test_import_reports_the_rows_it_could_not_read(client):
     bad = (
         b"Course Code,Section,Day,Start,End,Weeks\n"
-        b"111.701,A,Funday,14:00,17:00,1-12\n"
-        b"222.702,B,Monday,10:00,12:00,1-4\n"
+        b"133150,A,Funday,14:00,17:00,1-12\n"
+        b"133154,B,Monday,10:00,12:00,1-4\n"
     )
     preview = client.post(
         "/api/import/preview", files={"file": ("t.csv", bad, "text/csv")}
@@ -446,7 +447,7 @@ def test_a_timetable_row_can_be_added_and_removed(client):
 
 
 def test_deleting_a_class_takes_its_staffing_with_it(client):
-    target = row_id(client, "111.701", "A")
+    target = row_id(client, "133150", "SHOW-A")
     client.delete(f"/api/timetable/{target}")
     state = client.get("/api/state").json()
     assert all(a["timetable_id"] != target for a in state["assignments"])
@@ -474,10 +475,10 @@ COURSE_CSV = (
     b"Primary Programme,Course Coordinator,Course Coordinator Email,"
     b"Offering Coordinator,Offering Coordinator Email,Grade Reviewer,"
     b"Grade Reviewer Email,Offering Department\n"
-    b"133150,2027,S2FS,WLGI,Live Music Showcases,CCA,,Andre Ktori,"
+    b"144001,2027,S2FS,WLGI,A Course Of My Own,CCA,,Andre Ktori,"
     b"A.Ktori@massey.ac.nz,Dave Carter,D.Carter1@massey.ac.nz,,,MU00693\n"
-    b"111.701,2026,S1FS,WLGI,Design Studio Renamed,CCA,,Someone,s@x.ac.nz,"
-    b"Someone,s@x.ac.nz,,,SD00123\n"
+    b"133150,2027,S2FS,WLGI,Live Music Showcases Renamed,CCA,,Someone,"
+    b"s@x.ac.nz,Someone,s@x.ac.nz,,,MU00693\n"
 )
 
 
@@ -496,14 +497,14 @@ def test_the_sample_catalogue_is_bigger_than_the_timetable(conn):
 def test_state_carries_the_catalogue_and_the_offering_being_planned(client):
     body = client.get("/api/state").json()
     assert len(body["courses"]) == len(seed.COURSES)
-    assert body["settings"] == {"academic_year": "2026", "semester": "S1FS"}
+    assert body["settings"] == {"academic_year": "2027", "semester": "S2FS"}
     assert body["issues"] == []
 
 
 def test_classes_take_their_name_from_the_catalogue(client):
     classes = client.get("/api/state").json()["classes"]
-    studio = next(c for c in classes if c["course_code"] == "111.701")
-    assert studio["course_title"] == "Design Studio"
+    showcase = next(c for c in classes if c["course_code"] == "133150")
+    assert showcase["course_title"] == "Live Music Showcases"
 
 
 def test_renaming_a_course_renames_its_classes(client):
@@ -511,8 +512,8 @@ def test_renaming_a_course_renames_its_classes(client):
     client.post("/api/courses/import/commit", json={"rows": rows, "mode": "merge"})
 
     classes = client.get("/api/state").json()["classes"]
-    studio = next(c for c in classes if c["course_code"] == "111.701")
-    assert studio["course_title"] == "Design Studio Renamed"
+    showcase = next(c for c in classes if c["course_code"] == "133150")
+    assert showcase["course_title"] == "Live Music Showcases Renamed"
 
 
 def test_a_course_import_preview_writes_nothing(client):
@@ -521,9 +522,9 @@ def test_a_course_import_preview_writes_nothing(client):
 
     assert len(preview["rows"]) == 2
     assert preview["issues"] == []
-    assert preview["new"] == 1                     # 133150 is not held yet
-    assert preview["updating"] == 1                # 111.701 2026 S1FS WLGI is
-    assert preview["semesters"] == ["S1FS", "S2FS"]
+    assert preview["new"] == 1                     # 144001 is not held yet
+    assert preview["updating"] == 1                # 133150 2027 S2FS WLGI is
+    assert preview["semesters"] == ["S2FS"]
     assert client.get("/api/state").json()["courses"] == before
 
 
@@ -542,22 +543,22 @@ def test_merging_updates_in_place_rather_than_doubling_up(client):
 def test_replacing_the_catalogue_clears_what_is_not_in_the_file(client):
     rows = upload(client, "/api/courses/import/preview", COURSE_CSV).json()["rows"]
     result = client.post("/api/courses/import/commit",
-                         json={"rows": rows, "mode": "replace"}).json()
+                         json={"rows": rows, "mode": "replace_all"}).json()
     assert result["total"] == 2
-    assert result["removed"] == len(seed.COURSES) - 1   # 111.701 was re-imported
+    assert result["removed"] == len(seed.COURSES) - 1   # 133150 was re-imported
 
     codes = {c["code"] for c in client.get("/api/state").json()["courses"]}
-    assert codes == {"133150", "111.701"}
+    assert codes == {"144001", "133150"}
 
 
 def test_a_timetable_left_without_its_course_says_so(client):
     """Replacing the catalogue can strand a class. That must not be silent."""
     rows = upload(client, "/api/courses/import/preview", COURSE_CSV).json()["rows"]
-    client.post("/api/courses/import/commit", json={"rows": rows, "mode": "replace"})
+    client.post("/api/courses/import/commit", json={"rows": rows, "mode": "replace_all"})
 
     state = client.get("/api/state").json()
-    assert any("222.702: not in the course list" in i for i in state["issues"])
-    orphan = next(c for c in state["classes"] if c["course_code"] == "222.702")
+    assert any("133154: not in the course list" in i for i in state["issues"])
+    orphan = next(c for c in state["classes"] if c["course_code"] == "133154")
     assert orphan["course_title"] == ""
     assert orphan["staff_id"]                       # staffing is untouched
 
@@ -567,11 +568,11 @@ def test_importing_no_courses_is_refused(client):
 
 
 def test_the_offering_being_planned_can_be_set_and_cleared(client):
-    client.put("/api/settings", json={"academic_year": "2027", "semester": "S2FS"})
+    client.put("/api/settings", json={"academic_year": "2026", "semester": "S1FS"})
     state = client.get("/api/state").json()
-    assert state["settings"] == {"academic_year": "2027", "semester": "S2FS"}
-    # every sample course is a 2026 offering, so they are all flagged now
-    assert any("not as an offering in S2FS 2027" in i for i in state["issues"])
+    assert state["settings"] == {"academic_year": "2026", "semester": "S1FS"}
+    # every timetabled course is a 2027 S2FS offering, so they are all flagged now
+    assert any("not as an offering in S1FS 2026" in i for i in state["issues"])
 
     client.put("/api/settings", json={"academic_year": "", "semester": ""})
     assert client.get("/api/state").json()["issues"] == []
@@ -602,13 +603,174 @@ def test_state_carries_each_persons_shape(client):
     assert [d["weeks"] for d in ahern["departures"]] == [[11]]
     assert len(ahern["departures"][0]["added"]) == 1
 
-    # Edmond loses a workshop to ANZAC Day.
+    # Edmond loses a workshop to Labour Day, in the last teaching week.
     edmond = shapes["edmond"]
-    assert [d["weeks"] for d in edmond["departures"]] == [[8]]
-    assert edmond["departures"][0]["cancelled"][0]["label"] == "222.702 WS-A"
+    assert [d["weeks"] for d in edmond["departures"]] == [[12]]
+    assert edmond["departures"][0]["cancelled"][0]["label"] == "133154 WS-A"
 
     # Dalzell is the awkward one: a move, then two changes of load.
     assert [d["weeks"] for d in shapes["dalzell"]["departures"]] == [
         [5], [7, 8, 9], [10, 11, 12],
     ]
     assert len(shapes["dalzell"]["departures"][0]["moved"]) == 1
+
+
+# ------------------------------------------------------------ sample data
+
+TWO_SEMESTERS = (
+    b"Course Code,Course Name,Academic Year,Semester,Occurrence\n"
+    b"133150,Live Music Showcases,2027,S2FS,WLGI\n"
+    b"133167,Music Entrepreneurship 1,2027,S1FS,WLGI\n"
+)
+
+
+def test_the_sample_is_the_real_courses(conn):
+    seed.load(conn)
+    courses = {c.code: c for c in store.get_courses(conn)}
+    assert set(courses) == {"133150", "133154", "133167", "133168", "133175"}
+    assert courses["133154"].name == "Music, People, Places"
+    assert courses["133150"].coordinator == "Andre Ktori"
+
+    # Labour Day falls on the Monday of the last teaching week.
+    weeks = {w.number: w for w in store.get_weeks(conn)}
+    assert weeks[12].starts.isoformat() == "2027-10-25"
+    assert "Labour Day" in weeks[12].note
+
+
+def test_a_coordinator_is_never_a_teacher(conn):
+    """The distinction the whole catalogue rests on."""
+    seed.load(conn)
+    _, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
+    classes = engine.expand(timetable, exceptions, assignments, courses)
+
+    coordinators = {c.coordinator for c in courses} | {c.offering_coordinator for c in courses}
+    teaching = engine.teachers_for(classes)
+    names = {s.name for s in staff}
+
+    assert coordinators                      # there are some
+    assert not (coordinators & names)        # and none of them is staff
+    assert set(teaching) == {"133150", "133154", "133168"}
+    # Dave Carter coordinates 133168; other people teach it.
+    assert "Carter" in next(c for c in courses if c.code == "133168").coordinator
+    assert teaching["133168"] == ["brill", "chen", "dalzell"]
+
+
+def test_everything_the_sample_writes_is_flagged_as_sample(conn):
+    seed.load(conn)
+    assert store.has_sample(conn)
+    for table in store.SAMPLE_TABLES:
+        held = conn.execute(f"SELECT COUNT(*), SUM(is_sample) FROM {table}").fetchone()
+        assert held[0] > 0 and held[1] == held[0], table
+
+
+def test_a_cleared_database_stays_cleared_across_a_restart(conn):
+    """The bug: is_empty() asked whether the timetable was empty, so clearing
+    the sample and restarting brought it straight back."""
+    seed.load(conn)
+    seed.clear(conn)
+    assert not store.is_new(conn)              # a restart would not re-seed
+
+    if store.is_new(conn):                     # simulate app start
+        seed.load(conn)
+    assert store.get_courses(conn) == []
+    assert store.get_timetable(conn) == []
+
+
+def test_a_catalogue_imported_before_any_timetable_is_not_overwritten(conn):
+    """The same bug, the way it would actually bite: courses in, timetable not yet."""
+    seed.clear(conn)
+    rows, _ = importer.parse_courses("c.csv", TWO_SEMESTERS)
+    store.save_courses(conn, rows)
+
+    assert not store.is_new(conn)
+    if store.is_new(conn):
+        seed.load(conn)
+    assert {c.code for c in store.get_courses(conn)} == {"133150", "133167"}
+
+
+def test_removing_the_sample_leaves_imported_courses_standing(client):
+    rows = upload(client, "/api/courses/import/preview", TWO_SEMESTERS).json()["rows"]
+    client.post("/api/courses/import/commit", json={"rows": rows, "mode": "merge"})
+
+    assert client.get("/api/state").json()["has_sample"]
+    client.delete("/api/sample-data")
+
+    state = client.get("/api/state").json()
+    assert not state["has_sample"]
+    # 133150 and 133167 were imported over, so they are the user's now and stay;
+    # the three the user never touched go with the sample.
+    assert {c["code"] for c in state["courses"]} == {"133150", "133167"}
+    assert state["staff"] == []
+    assert state["timetable"] == []
+    assert state["settings"] == {"academic_year": "", "semester": ""}
+
+
+def test_importing_over_a_sample_row_makes_it_yours(conn):
+    seed.load(conn)
+    rows, _ = importer.parse_courses("c.csv", TWO_SEMESTERS)
+    store.save_courses(conn, rows)
+
+    flags = dict(conn.execute("SELECT code, is_sample FROM courses"))
+    assert flags["133150"] == 0 and flags["133167"] == 0     # imported
+    assert flags["133154"] == 1 and flags["133168"] == 1     # untouched
+
+
+def test_editing_a_sample_record_makes_it_yours(client):
+    target = row_id(client, "133150", "SHOW-A")
+    client.put(f"/api/timetable/{target}", json={
+        "course_code": "133150", "section": "SHOW-A", "day": "Tuesday",
+        "start": "14:00", "end": "17:00", "weeks": list(range(1, 13)),
+    })
+    client.delete("/api/sample-data")
+    remaining = {r["section"] for r in client.get("/api/state").json()["timetable"]}
+    assert remaining == {"SHOW-A"}
+
+
+def test_clear_everything_still_takes_the_lot(client):
+    client.delete("/api/all-data")
+    state = client.get("/api/state").json()
+    assert state["courses"] == [] and state["timetable"] == [] and state["staff"] == []
+    assert not state["has_sample"]
+
+
+# ------------------------------------------------------------ import modes
+
+def test_replacing_one_semester_leaves_the_others_alone(client):
+    """An export is usually one semester of a bigger catalogue."""
+    one = (
+        b"Course Code,Course Name,Academic Year,Semester,Occurrence\n"
+        b"144001,Something New,2027,S2FS,WLGI\n"
+    )
+    preview = upload(client, "/api/courses/import/preview", one).json()
+    assert preview["offerings"] == [{"academic_year": "2027", "semester": "S2FS"}]
+    assert preview["offering_holds"] == 3            # the three S2FS sample courses
+
+    client.post("/api/courses/import/commit",
+                json={"rows": preview["rows"], "mode": "replace_offering"})
+
+    held = {(c["code"], c["semester"]) for c in client.get("/api/state").json()["courses"]}
+    assert held == {("144001", "S2FS"), ("133167", "S1FS"), ("133175", "S1FS")}
+
+
+def test_replacing_a_semester_refreshes_every_semester_the_file_covers(client):
+    preview = upload(client, "/api/courses/import/preview", TWO_SEMESTERS).json()
+    assert [o["semester"] for o in preview["offerings"]] == ["S1FS", "S2FS"]
+
+    client.post("/api/courses/import/commit",
+                json={"rows": preview["rows"], "mode": "replace_offering"})
+    assert {c["code"] for c in client.get("/api/state").json()["courses"]} == {
+        "133150", "133167",
+    }
+
+
+def test_an_unknown_import_mode_is_refused(client):
+    rows = upload(client, "/api/courses/import/preview", TWO_SEMESTERS).json()["rows"]
+    reply = client.post("/api/courses/import/commit",
+                        json={"rows": rows, "mode": "obliterate"})
+    assert reply.status_code == 400
+
+
+def test_state_says_who_teaches_each_course(client):
+    teaching = client.get("/api/state").json()["teaching"]
+    assert teaching["133150"] == ["ahern", "brill", "chen"]   # not SHOW-D, nobody has it
+    assert "133167" not in teaching                            # not timetabled

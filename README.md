@@ -25,8 +25,8 @@ python app.py
 Then open <http://127.0.0.1:8000>.
 
 The database is a single file, `timetable.db`, created next to `app.py` on
-first run and loaded with sample data. Delete that file to start over, or use
-Clear everything on the Setup page.
+first run and loaded with sample data. Setup can take that sample out again, or
+clear the lot. Deleting the file starts over.
 
 ## How the data fits together
 
@@ -42,8 +42,12 @@ measure against. It is optional.
 
 **Courses** is the catalogue, imported from the student management system. It
 is reference, not plan: most of what it holds is accountability rather than
-teaching, and nothing in it is read as staffing. A course coordinator is not
-the person in the room. What the rest of the tool takes from it is identity,
+teaching, and nothing in it is read as staffing. **A course coordinator is not
+the person in the room, and the tool never treats one as staff.** Coordinators
+are text on the course record; staff are their own records with their own ids,
+and an assignment can only ever name a staff member. Nothing derives one from
+the other, in either direction. The Courses page shows both side by side so the
+difference is visible: who is accountable, and who is actually teaching. What the rest of the tool takes from it is identity,
 the code and the name a class is known by. It will normally hold more courses
 than you timetable, which is fine.
 
@@ -124,6 +128,12 @@ supervision, marking and admin.
 **Setup** holds staff, the teaching calendar, the timetable import, the year
 and semester you are planning, and the sample data controls.
 
+*Remove the sample data* takes out only what the app invented and leaves
+anything you have imported or typed, which matters because the sample uses real
+course codes: a blunt delete could take a real record with it. *Clear
+everything* is the other one, and means it. Either way it stays gone; a
+database somebody has emptied is not refilled on the next run.
+
 Naming the year and semester is optional. It is used for one thing: saying when
 a timetabled class is not an offering in the semester you are planning, which
 usually means a wrong course code.
@@ -151,10 +161,20 @@ Codes arrive from a spreadsheet as numbers and are kept as codes: `133150`, not
 `Course Coordinator` and `Course Coordinator Email` are two different things
 and folding them together would be worse than failing.
 
-*Add these to the catalogue* updates what it matches and adds the rest, so
-importing the same export twice changes nothing. *Replace the whole catalogue*
-deletes everything first, and asks before it does: an export is often one
-semester, and replacing would take the other one with it.
+Three ways to write it, because an export is usually one semester of a larger
+catalogue:
+
+- *Add these to the catalogue* updates what it matches and adds the rest, and
+  touches nothing else. Importing the same export twice changes nothing.
+- *Replace S2FS 2027* refreshes only the semesters the file covers, so a course
+  that has been dropped from that semester goes, and the other semester is left
+  alone. The button names the semesters it found.
+- *Replace the whole catalogue* deletes everything first, including semesters
+  the file says nothing about. It asks before it does.
+
+An imported row is yours, whatever it replaced. Importing over a course the
+sample supplied hands it over: it stops being sample data and stays when the
+sample is removed.
 
 ### A timetable
 
@@ -227,7 +247,7 @@ from the class it sits beside rather than the same thing counted twice.
 python -m pytest
 ```
 
-160 tests. The engine cases came from two real course outlines: a lecture
+173 tests. The engine cases came from two real course outlines: a lecture
 running in three weeks only, workshops shortened in those weeks so the lecturer
 is not double booked, a public holiday cancellation, a one week substitution,
 split semester teaching, and an added crit session.
@@ -245,7 +265,15 @@ which must not fold into it.
 
 The catalogue is tested for what a real export does: numeric codes, a course
 name with a comma in it, one code in two semesters, and the four coordinator
-columns staying apart.
+columns staying apart. One test asserts the thing the catalogue rests on: no
+coordinator is ever a staff member, and who teaches a course comes from
+assignments alone.
+
+Sample data has its own tests, including the bug they were written for: the
+check for "should this database be seeded" used to ask whether the timetable was
+empty, so clearing the sample and restarting brought it straight back, and
+importing a catalogue before entering any timetable invited the sample to land
+on top of it.
 
 Two more are guards rather than features. One removes the exceptions and
 asserts that the clash reappears, so the shortened workshop test cannot pass by
@@ -268,6 +296,9 @@ short version is: restart `python app.py` after replacing any files.
   assignment key and deciding what a clash means when two people share a slot.
 - The catalogue is read, never written back. Nothing here reaches the student
   management system.
+- The sample data uses real course codes. Importing your own export over them
+  is the intended path and hands those records over to you; removing the sample
+  afterwards leaves them alone.
 - No notifications yet. The engine returns everything needed to build them.
 - All courses share one teaching calendar. If some run to a different pattern,
   weeks gain a calendar name and clash detection matches on calendar plus week.

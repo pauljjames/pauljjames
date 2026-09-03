@@ -677,6 +677,25 @@ def shapes(classes: list[Class], staff: list[StaffMember], weeks: list[int]) -> 
     return [usual_week(classes, person.id, weeks) for person in staff]
 
 
+def teachers_for(classes: list[Class]) -> dict[str, list[str]]:
+    """Who actually teaches each course, per course code.
+
+    Derived from staffing and nothing else. The catalogue names a course
+    coordinator and an offering coordinator, and neither of them is this: a
+    coordinator is accountable for a course, not in the room. Keeping the two
+    apart is the whole reason this is a function over classes rather than a
+    column on Course.
+    """
+    found: dict[str, list[str]] = {}
+    for c in classes:
+        if not c.is_teaching:
+            continue
+        who = found.setdefault(c.course_code, [])
+        if c.staff_id not in who:
+            who.append(c.staff_id)
+    return {code: sorted(who) for code, who in found.items()}
+
+
 def find_clashes(classes: list[Class]) -> list[Clash]:
     """Every pair of classes the same person cannot both attend.
 
