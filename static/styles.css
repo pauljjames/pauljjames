@@ -560,6 +560,109 @@ table input:focus { border-color: var(--focus); background: var(--surface); }
 /* the clash panel still names classes inline */
 .klass { font-weight: 620; }
 
+/* the whole team, and the semester */
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--surface);
+}
+.seg button {
+  border: none;
+  border-right: 1px solid var(--rule-soft);
+  background: none;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.85rem;
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+.seg button:last-child { border-right: none; }
+.seg button:hover { background: var(--paper); }
+.seg button.on { background: var(--focus); color: #fff; }
+
+.blk.off { opacity: 0.55; }
+.blk.off .blk-label { text-decoration: line-through; }
+.blk.nobody { border-style: dashed; border-width: 1px 1px 1px 3px; color: var(--warn); }
+.blk-what { font-weight: 400; color: var(--ink-soft); }
+
+.gaps {
+  display: flex;
+  gap: 1.6rem;
+  flex-wrap: wrap;
+  border-top: 1px solid var(--rule-soft);
+  margin-top: 0.6rem;
+  padding-top: 0.7rem;
+  font-size: 0.85rem;
+}
+
+.timeline {
+  display: grid;
+  gap: 2px 3px;
+  align-items: center;
+  font-size: 0.85rem;
+}
+
+.tl-head {
+  font-size: 0.7rem;
+  font-weight: 620;
+  color: var(--quiet);
+  text-align: center;
+  padding-bottom: 2px;
+}
+
+.tl-person {
+  font-weight: 620;
+  letter-spacing: -0.012em;
+  padding-top: 0.55rem;
+  white-space: nowrap;
+}
+.tl-quiet {
+  padding-top: 0.55rem;
+  color: var(--quiet);
+  font-style: italic;
+  font-size: 0.8rem;
+}
+
+.tl-name {
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  text-align: right;
+  padding-right: 0.6rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tl-cell { height: 14px; border-radius: 2px; background: var(--gap); }
+.tl-cell.away    { background: var(--rule-soft); }
+.tl-cell.off     { background: repeating-linear-gradient(
+                     45deg, var(--rule-soft), var(--rule-soft) 2px,
+                     var(--gap) 2px, var(--gap) 4px); }
+.tl-cell.changed { background: var(--changed); }
+.tl-cell.added   { background: var(--added); }
+
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  border-top: 1px solid var(--rule-soft);
+  margin-top: 0.8rem;
+  padding-top: 0.6rem;
+}
+.legend i {
+  display: inline-block;
+  width: 16px;
+  height: 10px;
+  margin-right: 0.35rem;
+  vertical-align: baseline;
+}
+
 /* ------------------------------------------------------------ courses */
 
 .search {

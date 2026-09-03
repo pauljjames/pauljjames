@@ -125,11 +125,13 @@ by accident. Taking weeks somebody else holds asks first.
 The refusal is enforced in the API as well as shown in the interface, so it
 holds however the write arrives.
 
-**Staff** is each person's semester as the week they repeat, then only the
-weeks that depart from it. A twelve week semester is rarely twelve different
-weeks, and the version of this page that showed all of them ran to four
-thousand pixels of near identical cards with the few weeks that mattered lost
-among them.
+**Staff** answers three questions, and a switch at the top picks which. Whichever
+you looked at last is what you get next time.
+
+*Each person* is their semester as the week they repeat, then only the weeks
+that depart from it. A twelve week semester is rarely twelve different weeks,
+and the version of this page that showed all of them ran to four thousand pixels
+of near identical cards with the few weeks that mattered lost among them.
 
 So each person gets one grid of their usual week, and underneath it a line per
 departure: a class cancelled, a class moved, an extra session, or a class that
@@ -140,6 +142,19 @@ red means a clash and nothing else.
 
 Which week counts as usual is the one held most often; a tie goes to whichever
 comes first, so the answer does not wander between visits.
+
+*The whole team* is everyone at once in one week, laid out as the week is. Free
+time is the empty space, which is what you are looking at when you have a class
+to give away, and underneath it names what nobody is on and who is free at that
+hour. Pick the week along the top.
+
+*The semester* is every commitment as a bar across the twelve weeks. A handover
+is one bar stopping where another starts, so a split semester, a cancelled week
+and a three week lecture are all the same picture, read left to right.
+
+Colour means the day in the first mode, because within one person the day is
+what there is to tell apart; it means the person in the other two, because there
+the people are.
 
 **Load** is contact hours per person per week, against their target. Timetabled
 minutes only, so it will not match a workload allocation that also covers

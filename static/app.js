@@ -3,7 +3,7 @@
 // Kept in step with VERSION in app.py. The browser reads this file fresh on
 // every load but the routes live in the running server, so a new front end can
 // meet an old one. This is what lets the page say so.
-const APP_VERSION = "2026-09-05.1";
+const APP_VERSION = "2026-09-05.2";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
               "Saturday", "Sunday"];
@@ -1079,6 +1079,32 @@ const clockLabel = (minutes) => {
 const HALF_HOUR = 17;                 // px; the grid's one fixed measure
 const perMinute = HALF_HOUR / 30;
 
+// Three questions, three shapes, one page. Which one you were last looking at
+// survives a reload, because switching every visit is a tax.
+const STAFF_MODES = [
+  ["person", "Each person"],
+  ["week", "The whole team"],
+  ["semester", "The semester"],
+];
+
+function rememberedMode() {
+  try {
+    const held = localStorage.getItem("staffMode");
+    return STAFF_MODES.some(([id]) => id === held) ? held : "person";
+  } catch {
+    return "person";                       // a private window, or storage refused
+  }
+}
+
+let staffMode = rememberedMode();
+let teamWeek = null;
+
+function setStaffMode(mode) {
+  staffMode = mode;
+  try { localStorage.setItem("staffMode", mode); } catch { /* not important */ }
+  render();
+}
+
 function staffView() {
   const wrap = el("div", {}, staleServerBanner());
 
@@ -1087,6 +1113,38 @@ function staffView() {
     return wrap;
   }
 
+  const switcher = el("div", { class: "seg" });
+  for (const [id, label] of STAFF_MODES) {
+    switcher.append(el("button", {
+      class: staffMode === id ? "on" : "",
+      "aria-pressed": staffMode === id ? "true" : "false",
+      text: label,
+      onclick: () => setStaffMode(id),
+    }));
+  }
+
+  const bar = el("div", { class: "toolbar" }, switcher);
+  if (staffMode === "week") bar.append(teamWeekPicker());
+  wrap.append(bar);
+
+  if (staffMode === "week") wrap.append(teamMode());
+  else if (staffMode === "semester") wrap.append(semesterMode());
+  else wrap.append(peopleMode());
+
+  wrap.append(el("div", { class: "toolbar" },
+    staffMode === "person"
+      ? dayKey()
+      : el("span", { class: "muted", text: "Colour is the person." })));
+  wrap.append(el("p", { class: "hint" },
+    "Teaching outside this timetable is not tracked, so an empty week here does ",
+    "not mean that person is free."));
+  return wrap;
+}
+
+// ----------------------------------------------------------- each person
+
+function peopleMode() {
+  const wrap = el("div", {});
   wrap.append(el("p", { class: "hint" },
     "A semester is mostly one week repeated. Each person shows the week they ",
     "repeat, and then only the weeks that depart from it."));
@@ -1097,12 +1155,177 @@ function staffView() {
     people.append(personPanel(person, shapes.get(person.id)));
   }
   wrap.append(people);
-
-  wrap.append(el("div", { class: "toolbar" }, dayKey()));
-  wrap.append(el("p", { class: "hint" },
-    "Teaching outside this timetable is not tracked, so an empty week here does ",
-    "not mean that person is free."));
   return wrap;
+}
+
+// ----------------------------------------------------------- the whole team
+
+function teamWeekPicker() {
+  const weeks = weekNumbers();
+  if (!weeks.includes(teamWeek)) teamWeek = weeks[0] ?? null;
+
+  const box = el("div", { class: "scope" },
+    el("span", { class: "label", text: "Week" }));
+  for (const number of weeks) {
+    box.append(el("button", {
+      class: teamWeek === number ? "pill on" : "pill", text: String(number),
+      onclick: () => { teamWeek = number; render(); },
+    }));
+  }
+
+  const week = state.weeks.find((w) => w.number === teamWeek);
+  if (week) {
+    box.append(el("span", { class: "muted" },
+      shortDate(week.starts), week.note ? ` · ${week.note}` : ""));
+  }
+  return box;
+}
+
+function teamMode() {
+  const panel = el("section", { class: "panel" });
+
+  if (teamWeek === null) {
+    panel.append(el("p", { class: "empty", text: "No teaching calendar yet." }));
+    return panel;
+  }
+
+  panel.append(el("p", { class: "hint" },
+    "Everyone at once, laid out as the week is. Free time is the empty space, ",
+    "which is what you are looking for when you have a class to give away."));
+
+  const classes = state.classes.filter((c) => c.week === teamWeek);
+  panel.append(weekGrid(classes, { colourBy: "person", showWho: true }));
+  panel.append(teamGaps(classes));
+  return panel;
+}
+
+/** Is this person clear at that time in that week? */
+function isFreeAt(staffId, week, day, start, end) {
+  return !state.classes.some((c) =>
+    c.staff_id === staffId && c.week === week && c.day === day
+    && c.runs && c.start && c.end
+    && toMinutes(c.start) < toMinutes(end) && toMinutes(start) < toMinutes(c.end));
+}
+
+function teamGaps(classes) {
+  const uncovered = classes.filter((c) => c.runs && !c.staff_id);
+  const box = el("div", { class: "gaps" });
+
+  if (!uncovered.length) {
+    box.append(el("span", { class: "muted",
+      text: "Everything that runs this week has somebody on it." }));
+    return box;
+  }
+
+  for (const c of uncovered) {
+    const free = state.staff
+      .filter((p) => isFreeAt(p.id, c.week, c.day, c.start, c.end))
+      .map((p) => p.name);
+    box.append(el("div", {},
+      el("div", { class: "caption", text: `Nobody on ${c.label}` }),
+      el("div", {}, `${c.day} ${c.start}–${c.end} · `,
+        el("span", { class: free.length ? "" : "muted" },
+          free.length ? `free then: ${free.join(", ")}` : "nobody is free then"))));
+  }
+  return box;
+}
+
+// ----------------------------------------------------------- the semester
+
+/** One line per class a person holds, and what each week does to it. */
+function timelineFor(staffId, weeks) {
+  const lines = new Map();
+  for (const c of state.classes) {
+    if (c.staff_id !== staffId) continue;
+    const added = c.timetable_row_id == null;
+    const key = added ? `add:${c.exception_id}` : `row:${c.timetable_row_id}`;
+    if (!lines.has(key)) {
+      // An extra session carries the same course and section as the class it is
+      // extra to, so it needs saying which line is which.
+      lines.set(key, {
+        label: added ? `${c.label} extra` : c.label,
+        title: c.course_title,
+        byWeek: new Map(),
+      });
+    }
+    lines.get(key).byWeek.set(c.week, c);
+  }
+
+  return [...lines.values()]
+    .sort((a, b) => a.label.localeCompare(b.label))
+    .map((line) => ({
+      label: line.label,
+      title: line.title,
+      cells: weeks.map((number) => {
+        const c = line.byWeek.get(number);
+        if (!c) return { kind: "away", note: `Week ${number}: not this week` };
+        if (!c.runs) return { kind: "off", note: `Week ${number}: cancelled` };
+        if (c.status === "Changed") {
+          return { kind: "changed",
+                   note: `Week ${number}: moved to ${c.day} ${c.start}–${c.end}` };
+        }
+        if (c.status === "Added") {
+          return { kind: "added", note: `Week ${number}: extra, ${c.day} ${c.start}–${c.end}` };
+        }
+        return { kind: "on", ink: personColour(staffId),
+                 note: `Week ${number}: ${c.day} ${c.start}–${c.end}` };
+      }),
+    }));
+}
+
+function semesterMode() {
+  const weeks = weekNumbers();
+  const panel = el("section", { class: "panel" });
+
+  if (!weeks.length) {
+    panel.append(el("p", { class: "empty", text: "No teaching calendar yet." }));
+    return panel;
+  }
+
+  panel.append(el("p", { class: "hint" },
+    "Every commitment as a bar across the semester. Handovers, split semesters, ",
+    "cancellations and gaps are all the same picture, read left to right."));
+
+  const grid = el("div", {
+    class: "timeline",
+    style: `grid-template-columns: 11rem repeat(${weeks.length}, minmax(0, 1fr))`,
+  });
+
+  grid.append(el("div", {}));
+  for (const number of weeks) {
+    grid.append(el("div", { class: "tl-head", text: String(number) }));
+  }
+
+  for (const person of state.staff) {
+    const lines = timelineFor(person.id, weeks);
+
+    grid.append(el("div", { class: "tl-person" },
+      el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
+      person.name));
+    grid.append(el("div", { class: "tl-quiet", style: `grid-column: span ${weeks.length}` },
+      lines.length ? "" : "nothing timetabled"));
+
+    for (const line of lines) {
+      grid.append(el("div", { class: "tl-name", title: line.title || "", text: line.label }));
+      for (const cell of line.cells) {
+        grid.append(el("div", {
+          class: `tl-cell ${cell.kind}`,
+          style: cell.ink ? `background:${cell.ink}` : null,
+          title: cell.note,
+        }));
+      }
+    }
+  }
+
+  panel.append(grid);
+  panel.append(el("div", { class: "legend" },
+    el("span", {}, el("i", { class: "tl-cell off" }), "cancelled"),
+    el("span", {}, el("i", { class: "tl-cell changed" }), "moved"),
+    el("span", {}, el("i", { class: "tl-cell added" }), "extra"),
+    el("span", {}, el("i", { class: "tl-cell away" }), "not that week"),
+    el("span", { class: "spacer" }),
+    el("span", { class: "muted", text: "A bar is that person's colour." })));
+  return panel;
 }
 
 function personPanel(person, shape) {
@@ -1150,7 +1373,7 @@ function describeUsual(shape) {
     : `Weeks ${weekRanges(usual)}`;
 }
 
-function weekGrid(classes) {
+function weekGrid(classes, options = {}) {
   const [from, to] = gridRange();
   const days = daysInUse();
   const height = (to - from) * perMinute;
@@ -1174,7 +1397,7 @@ function weekGrid(classes) {
     for (let m = from; m < to; m += 60) {
       col.append(el("div", { class: "rule", style: `top:${(m - from) * perMinute}px` }));
     }
-    for (const block of blocksFor(classes.filter((c) => c.day === day), from)) {
+    for (const block of blocksFor(classes.filter((c) => c.day === day), from, options)) {
       col.append(block);
     }
     cols.append(col);
@@ -1186,7 +1409,7 @@ function weekGrid(classes) {
 }
 
 /** Classes sharing a slot stack inside it, so neither is hidden by the other. */
-function blocksFor(classes, from) {
+function blocksFor(classes, from, { colourBy = "day", showWho = false } = {}) {
   const slots = new Map();
   for (const c of classes) {
     if (!c.start || !c.end) continue;
@@ -1202,19 +1425,30 @@ function blocksFor(classes, from) {
     const each = span / group.length;
 
     group.forEach((c, index) => {
-      const ink = dayColour(c.day);
+      const nobody = colourBy === "person" && !c.staff_id;
+      const ink = nobody ? "var(--gap)"
+        : colourBy === "person" ? personColour(c.staff_id) : dayColour(c.day);
+      const box = `top:${(start - from) * perMinute + index * each}px;`
+                + ` height:${each - 2}px; border-left-color:${ink};`;
+
       out.push(el("div", {
-        class: `blk ${c.clashing ? "clash" : ""}`,
-        style: `top:${(start - from) * perMinute + index * each}px;`
-             + ` height:${each - 2}px;`
-             + ` border-left-color:${ink};`
-             + ` background:color-mix(in srgb, ${ink} 11%, var(--surface))`,
+        class: `blk ${c.clashing ? "clash" : ""} ${c.runs ? "" : "off"} ${nobody ? "nobody" : ""}`,
+        style: nobody
+          ? `${box} background:var(--warn-wash)`
+          : `${box} background:color-mix(in srgb, ${ink} 11%, var(--surface))`,
         title: `${c.label}${c.course_title ? " " + c.course_title : ""}, `
-             + `${c.day} ${c.start}-${c.end}`,
+             + `${c.day} ${c.start}-${c.end}`
+             + (showWho ? `, ${c.staff_id ? staffName(c.staff_id) : "nobody"}` : ""),
       },
-        el("span", { class: "blk-label", text: c.label }),
-        el("span", { class: "blk-when", text: `${c.start}–${c.end}` }),
-        c.course_title && each >= 46
+        showWho
+          ? el("span", { class: "blk-label" },
+              c.staff_id ? staffName(c.staff_id).split(",")[0] : "nobody",
+              el("span", { class: "blk-what", text: ` ${c.label}` }))
+          : el("span", { class: "blk-label", text: c.label }),
+        // Four studios stacked in one slot leave about 25px each, which is one
+        // line. The label wins; the time is in the tooltip either way.
+        each >= 30 ? el("span", { class: "blk-when", text: `${c.start}–${c.end}` }) : null,
+        !showWho && c.course_title && each >= 46
           ? el("span", { class: "blk-title", text: c.course_title })
           : null));
     });
