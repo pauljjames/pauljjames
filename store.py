@@ -12,7 +12,9 @@ import sqlite3
 from datetime import date, time
 from pathlib import Path
 
-from engine import Action, Assignment, ExceptionRow, StaffMember, TimetableRow, Week
+from engine import (
+    Action, Assignment, Course, ExceptionRow, StaffMember, TimetableRow, Week,
+)
 
 DB_PATH = Path(__file__).parent / "timetable.db"
 
@@ -31,14 +33,39 @@ CREATE TABLE IF NOT EXISTS staff (
     target_minutes  INTEGER
 );
 
+-- The catalogue, as exported from the student management system. Identity is
+-- the whole offering: one code can run in both semesters.
+CREATE TABLE IF NOT EXISTS courses (
+    code                        TEXT NOT NULL,
+    academic_year               TEXT NOT NULL DEFAULT '',
+    semester                    TEXT NOT NULL DEFAULT '',
+    occurrence                  TEXT NOT NULL DEFAULT '',
+    name                        TEXT NOT NULL DEFAULT '',
+    college                     TEXT NOT NULL DEFAULT '',
+    programme                   TEXT NOT NULL DEFAULT '',
+    coordinator                 TEXT NOT NULL DEFAULT '',
+    coordinator_email           TEXT NOT NULL DEFAULT '',
+    offering_coordinator        TEXT NOT NULL DEFAULT '',
+    offering_coordinator_email  TEXT NOT NULL DEFAULT '',
+    grade_reviewer              TEXT NOT NULL DEFAULT '',
+    grade_reviewer_email        TEXT NOT NULL DEFAULT '',
+    department                  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (code, academic_year, semester, occurrence)
+);
+
+-- A course is named in one place, so the timetable does not carry a title.
 CREATE TABLE IF NOT EXISTS timetable (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     course_code   TEXT NOT NULL,
-    course_title  TEXT NOT NULL DEFAULT '',
     section       TEXT NOT NULL,
     day           TEXT NOT NULL,
     start         TEXT NOT NULL,
     end           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS timetable_weeks (
@@ -73,6 +100,7 @@ CREATE TABLE IF NOT EXISTS exceptions (
     note          TEXT NOT NULL DEFAULT ''
 );
 
+CREATE INDEX IF NOT EXISTS ix_courses_code ON courses (code);
 CREATE INDEX IF NOT EXISTS ix_tt_weeks ON timetable_weeks (week);
 CREATE INDEX IF NOT EXISTS ix_assign_staff ON assignments (staff_id);
 CREATE INDEX IF NOT EXISTS ix_exc_key ON exceptions (week, course_code, section);
@@ -146,6 +174,27 @@ def get_staff(conn) -> list[StaffMember]:
     ]
 
 
+COURSE_FIELDS = (
+    "code", "academic_year", "semester", "occurrence", "name", "college",
+    "programme", "coordinator", "coordinator_email", "offering_coordinator",
+    "offering_coordinator_email", "grade_reviewer", "grade_reviewer_email",
+    "department",
+)
+
+
+def get_courses(conn) -> list[Course]:
+    return [
+        Course(**{field: r[field] for field in COURSE_FIELDS})
+        for r in conn.execute(
+            "SELECT * FROM courses ORDER BY code, academic_year, semester, occurrence"
+        )
+    ]
+
+
+def get_settings(conn) -> dict:
+    return {r["key"]: r["value"] for r in conn.execute("SELECT * FROM settings")}
+
+
 def get_timetable(conn) -> list[TimetableRow]:
     weeks_by_row: dict[int, set[int]] = {}
     for r in conn.execute("SELECT * FROM timetable_weeks"):
@@ -155,7 +204,6 @@ def get_timetable(conn) -> list[TimetableRow]:
         TimetableRow(
             id=r["id"],
             course_code=r["course_code"],
-            course_title=r["course_title"],
             section=r["section"],
             day=r["day"],
             start=to_time(r["start"]),
@@ -206,6 +254,7 @@ def load_all(conn):
         get_timetable(conn),
         get_exceptions(conn),
         get_assignments(conn),
+        get_courses(conn),
     )
 
 
@@ -273,7 +322,6 @@ def _write_weeks_for_row(conn, timetable_id: int, weeks) -> None:
 def save_timetable_row(conn, row: dict, row_id: int | None = None) -> int:
     values = (
         row["course_code"],
-        row.get("course_title") or "",
         row["section"],
         row["day"],
         row["start"],
@@ -283,14 +331,14 @@ def save_timetable_row(conn, row: dict, row_id: int | None = None) -> int:
     with conn:
         if row_id is None:
             cur = conn.execute(
-                "INSERT INTO timetable (course_code, course_title, section,"
-                " day, start, end) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO timetable (course_code, section, day, start, end)"
+                " VALUES (?, ?, ?, ?, ?)",
                 values,
             )
             row_id = cur.lastrowid
         else:
             conn.execute(
-                "UPDATE timetable SET course_code = ?, course_title = ?, section = ?,"
+                "UPDATE timetable SET course_code = ?, section = ?,"
                 " day = ?, start = ?, end = ? WHERE id = ?",
                 values + (row_id,),
             )
@@ -375,6 +423,64 @@ def save_exception(conn, row: dict, row_id: int | None = None) -> int:
 def delete_exception(conn, row_id: int) -> None:
     with conn:
         conn.execute("DELETE FROM exceptions WHERE id = ?", (row_id,))
+
+
+# ------------------------------------------------------------ courses
+
+def save_courses(conn, rows: list[dict], replace: bool = False) -> dict:
+    """Write catalogue rows, keyed on the whole offering.
+
+    Re-importing the same export is not meant to double it up, so a row that
+    already exists is overwritten rather than added beside itself. Replacing is
+    the deliberate, destructive version and has to be asked for: an export is
+    often one semester, and wiping the other one silently would be wrong.
+    """
+    before = {c.key for c in get_courses(conn)}
+    values = [
+        tuple(str(row.get(field) or "") for field in COURSE_FIELDS)
+        for row in rows
+    ]
+    placeholders = ", ".join("?" * len(COURSE_FIELDS))
+
+    with conn:
+        if replace:
+            conn.execute("DELETE FROM courses")
+        conn.executemany(
+            f"INSERT OR REPLACE INTO courses ({', '.join(COURSE_FIELDS)})"
+            f" VALUES ({placeholders})",
+            values,
+        )
+
+    after = {c.key for c in get_courses(conn)}
+    incoming = {
+        (str(r.get("code") or ""), str(r.get("academic_year") or ""),
+         str(r.get("semester") or ""), str(r.get("occurrence") or ""))
+        for r in rows
+    }
+    return {
+        "added": len(incoming - before),
+        "updated": len(incoming & before),
+        "removed": len(before - after),
+        "total": len(after),
+    }
+
+
+def delete_course(conn, code: str, academic_year: str, semester: str, occurrence: str) -> None:
+    with conn:
+        conn.execute(
+            "DELETE FROM courses WHERE code = ? AND academic_year = ?"
+            " AND semester = ? AND occurrence = ?",
+            (code, academic_year, semester, occurrence),
+        )
+
+
+def set_settings(conn, values: dict) -> None:
+    with conn:
+        conn.executemany(
+            "INSERT INTO settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [(str(k), str(v if v is not None else "")) for k, v in values.items()],
+        )
 
 
 # ------------------------------------------------------------ import

@@ -3,7 +3,7 @@
 // Kept in step with VERSION in app.py. The browser reads this file fresh on
 // every load but the routes live in the running server, so a new front end can
 // meet an old one. This is what lets the page say so.
-const APP_VERSION = "2026-09-01.1";
+const APP_VERSION = "2026-09-03.1";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
               "Saturday", "Sunday"];
@@ -658,6 +658,35 @@ function clashPanel() {
 
 // ------------------------------------------------------------ staff view
 
+// The grid has the same shape for everybody, so two people can be compared, and
+// its range comes from the whole timetable rather than one person's slice.
+function gridRange() {
+  const times = state.classes.filter((c) => c.start && c.end);
+  if (!times.length) return [9 * 60, 17 * 60];
+  const from = Math.min(...times.map((c) => toMinutes(c.start)));
+  const to = Math.max(...times.map((c) => toMinutes(c.end)));
+  return [Math.floor(from / 60) * 60, Math.ceil(to / 60) * 60];
+}
+
+function daysInUse() {
+  const seen = new Set(state.classes.map((c) => c.day).filter(Boolean));
+  const days = DAYS.filter((d) => seen.has(d));
+  return days.length ? days : DAYS.slice(0, 5);
+}
+
+const toMinutes = (hhmm) => {
+  const [h, m] = String(hhmm).split(":").map(Number);
+  return h * 60 + m;
+};
+
+const clockLabel = (minutes) => {
+  const h = Math.floor(minutes / 60);
+  return h > 12 ? String(h - 12) : String(h);
+};
+
+const HALF_HOUR = 17;                 // px; the grid's one fixed measure
+const perMinute = HALF_HOUR / 30;
+
 function staffView() {
   const wrap = el("div", {}, staleServerBanner());
 
@@ -666,61 +695,201 @@ function staffView() {
     return wrap;
   }
 
-  wrap.append(el("div", { class: "toolbar" }, dayKey()));
+  wrap.append(el("p", { class: "hint" },
+    "A semester is mostly one week repeated. Each person shows the week they ",
+    "repeat, and then only the weeks that depart from it."));
 
+  const shapes = new Map((state.shapes || []).map((s) => [s.staff_id, s]));
+  const people = el("div", { class: "people" });
   for (const person of state.staff) {
-    const mine = state.classes.filter((c) => c.staff_id === person.id);
-    const byWeek = new Map();
-    for (const c of mine) {
-      if (!byWeek.has(c.week)) byWeek.set(c.week, []);
-      byWeek.get(c.week).push(c);
-    }
-
-    const panel = el("section", { class: "panel" },
-      el("div", { class: "toolbar" },
-        el("h2", {},
-          el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
-          person.name),
-        el("span", { class: "spacer" }),
-        el("span", { class: "muted", text: `${mine.filter((c) => c.runs).length} classes` })));
-
-    const grid = el("div", { class: "weeks" });
-    for (const week of state.weeks) {
-      const classes = (byWeek.get(week.number) || [])
-        .sort((a, b) => DAYS.indexOf(a.day) - DAYS.indexOf(b.day) ||
-                        String(a.start).localeCompare(String(b.start)));
-      grid.append(el("div", { class: "week" },
-        el("div", { class: "week-head" },
-          el("strong", { text: `Week ${week.number}` }),
-          el("span", { class: "muted", text: shortDate(week.starts) }),
-          week.note ? el("div", { class: "muted note", text: week.note }) : null),
-        classes.length
-          ? classes.map(classCard)
-          : el("div", { class: "empty", text: "nothing timetabled" })));
-    }
-    panel.append(grid);
-    wrap.append(panel);
+    people.append(personPanel(person, shapes.get(person.id)));
   }
+  wrap.append(people);
 
+  wrap.append(el("div", { class: "toolbar" }, dayKey()));
   wrap.append(el("p", { class: "hint" },
     "Teaching outside this timetable is not tracked, so an empty week here does ",
     "not mean that person is free."));
   return wrap;
 }
 
-function classCard(c) {
-  const status = !c.runs ? "cancelled" : c.status === "Changed" ? "changed"
-    : c.status === "Added" ? "added" : "";
-  return el("div", {
-    class: `klass ${status} ${c.clashing ? "clash" : ""}`,
-    style: `border-left-color:${dayColour(c.day)}`,
-  },
-    el("div", { class: "klass-label" }, c.label,
-      c.clashing ? el("span", { class: "badge bad", text: "clash" }) : null),
-    el("div", { class: "muted" },
-      c.runs ? `${c.day} ${c.start}–${c.end}` : "cancelled"),
-    c.status === "Added" ? el("span", { class: "badge", text: "added" }) : null,
-    c.status === "Changed" ? el("span", { class: "badge", text: "changed" }) : null);
+function personPanel(person, shape) {
+  const panel = el("section", { class: "panel person" });
+  const byWeek = state.load[person.id] || {};
+  const total = Object.values(byWeek).reduce((sum, m) => sum + m, 0);
+  const average = total / (weekNumbers().length || 1);
+  const target = person.target_minutes;
+  const spikes = state.over_target.filter((o) => o.staff_id === person.id);
+
+  panel.append(el("div", { class: "toolbar" },
+    el("h2", {},
+      el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
+      person.name),
+    el("span", { class: "spacer" }),
+    spikes.length
+      ? el("span", { class: "flag warn", text: `over in ${weekRanges(spikes.map((o) => o.week))}` })
+      : null,
+    el("span", { class: "muted" },
+      `${hours(average)} h a week`,
+      target ? el("span", { text: ` of ${hours(target)}` }) : null)));
+
+  if (!shape || (!shape.usual.length && !shape.departures.length)) {
+    panel.append(el("p", { class: "empty", text: "Nothing timetabled." }));
+    return panel;
+  }
+
+  panel.append(el("div", { class: "muted usual-weeks", text: describeUsual(shape) }));
+  panel.append(weekGrid(shape.usual));
+  panel.append(departures(shape));
+  return panel;
+}
+
+/** "Every week", "Every week except 8", "Weeks 1-4 and 6". */
+function describeUsual(shape) {
+  const all = weekNumbers();
+  const usual = shape.usual_weeks;
+  if (!usual.length) return "No week is typical";
+  if (usual.length === all.length) return "Every week";
+  // "Every week except 7-12" is true of a six/six split and tells nobody
+  // anything. Say it that way only when the exceptions really are few.
+  const missing = all.filter((w) => !usual.includes(w));
+  return missing.length * 3 <= all.length
+    ? `Every week except ${weekRanges(missing)}`
+    : `Weeks ${weekRanges(usual)}`;
+}
+
+function weekGrid(classes) {
+  const [from, to] = gridRange();
+  const days = daysInUse();
+  const height = (to - from) * perMinute;
+
+  const gutter = el("div", { class: "gutter", style: `height:${height}px` });
+  for (let m = from; m < to; m += 60) {
+    gutter.append(el("span", {
+      class: "hour", style: `top:${(m - from) * perMinute}px`, text: clockLabel(m),
+    }));
+  }
+
+  const cols = el("div", {
+    class: "gridcols",
+    style: `grid-template-columns: repeat(${days.length}, minmax(0, 1fr))`,
+  });
+  for (const day of days) {
+    cols.append(el("div", { class: "dayhead", text: day.slice(0, 3) }));
+  }
+  for (const day of days) {
+    const col = el("div", { class: "col", style: `height:${height}px` });
+    for (let m = from; m < to; m += 60) {
+      col.append(el("div", { class: "rule", style: `top:${(m - from) * perMinute}px` }));
+    }
+    for (const block of blocksFor(classes.filter((c) => c.day === day), from)) {
+      col.append(block);
+    }
+    cols.append(col);
+  }
+
+  return el("div", { class: "weekgrid" },
+    el("div", { class: "gutterwrap" }, el("div", { class: "gutterhead" }), gutter),
+    cols);
+}
+
+/** Classes sharing a slot stack inside it, so neither is hidden by the other. */
+function blocksFor(classes, from) {
+  const slots = new Map();
+  for (const c of classes) {
+    if (!c.start || !c.end) continue;
+    const key = `${c.start}-${c.end}`;
+    if (!slots.has(key)) slots.set(key, []);
+    slots.get(key).push(c);
+  }
+
+  const out = [];
+  for (const group of slots.values()) {
+    const start = toMinutes(group[0].start);
+    const span = (toMinutes(group[0].end) - start) * perMinute;
+    const each = span / group.length;
+
+    group.forEach((c, index) => {
+      const ink = dayColour(c.day);
+      out.push(el("div", {
+        class: `blk ${c.clashing ? "clash" : ""}`,
+        style: `top:${(start - from) * perMinute + index * each}px;`
+             + ` height:${each - 2}px;`
+             + ` border-left-color:${ink};`
+             + ` background:color-mix(in srgb, ${ink} 11%, var(--surface))`,
+        title: `${c.label}${c.course_title ? " " + c.course_title : ""}, `
+             + `${c.day} ${c.start}-${c.end}`,
+      },
+        el("span", { class: "blk-label", text: c.label }),
+        el("span", { class: "blk-when", text: `${c.start}–${c.end}` }),
+        c.course_title && each >= 46
+          ? el("span", { class: "blk-title", text: c.course_title })
+          : null));
+    });
+  }
+  return out;
+}
+
+function departures(shape) {
+  if (shape.settled) {
+    return el("div", { class: "settled" },
+      el("span", { class: "muted", text: "The same week, every week." }));
+  }
+
+  const box = el("div", { class: "departures" },
+    el("div", { class: "caption", text: "Different in" }));
+
+  for (const away of shape.departures) {
+    box.append(el("div", { class: "dep" },
+      el("div", { class: "dep-weeks", text:
+        `${away.weeks.length > 1 ? "Weeks" : "Week"} ${weekRanges(away.weeks)}` }),
+      el("div", { class: "dep-what" }, describeDeparture(away).map((line) =>
+        el("div", {}, line.text,
+          line.note ? el("span", { class: "muted", text: ` ${line.note}` }) : null,
+          line.badge
+            ? el("span", { class: `badge ${line.badge}`, text: BADGE_WORDS[line.badge] })
+            : null)))));
+  }
+  return box;
+}
+
+const BADGE_WORDS = { add: "added", change: "changed", cancel: "cancelled" };
+
+function describeDeparture(away) {
+  const lines = [];
+  for (const c of away.cancelled) {
+    lines.push({ text: `${c.label} does not run`, badge: "cancel" });
+  }
+  for (const move of away.moved) {
+    const to = move.instead;
+    lines.push({
+      text: `${to.label} moves to ${to.day} ${to.start}–${to.end}`,
+      badge: "change",
+    });
+  }
+  for (const c of away.added) {
+    lines.push({
+      text: `Also ${c.label}, ${c.day} ${c.start}–${c.end}`,
+      badge: c.status === "Added" ? "add" : null,
+    });
+  }
+  for (const c of away.gone) {
+    const who = whoElseHasIt(c, away.weeks[0]);
+    lines.push({
+      text: `Not on ${c.label}`,
+      note: who ? `(${who} has it)` : "(nobody has it)",
+    });
+  }
+  return lines;
+}
+
+function whoElseHasIt(cls, week) {
+  const match = state.classes.find((c) =>
+    c.week === week && c.runs
+    && (cls.timetable_row_id
+      ? c.timetable_row_id === cls.timetable_row_id
+      : c.exception_id === cls.exception_id));
+  return match && match.staff_id ? staffName(match.staff_id) : null;
 }
 
 // ------------------------------------------------------------ load
@@ -832,6 +1001,230 @@ function describeOverride(x) {
   return bits.length ? bits.join(" ") : (x.action === "Cancel" ? "" : "no change given");
 }
 
+// ------------------------------------------------------------ courses
+
+let courseQuery = "";
+let courseSemester = "";
+let coursePreview = null;
+
+const COURSE_PAGE = 60;
+
+function coursesView() {
+  const wrap = el("div", {}, staleServerBanner(), issuesPanel());
+
+  wrap.append(coursesImportPanel());
+
+  const panel = el("section", { class: "panel" },
+    el("div", { class: "toolbar" },
+      el("h2", { text: "Courses" }),
+      el("span", { class: "spacer" })));
+
+  panel.append(el("p", { class: "hint" },
+    "Everything the student management system knows about these offerings. It is ",
+    "a catalogue, not a plan: most of it is accountability rather than teaching, ",
+    "and nobody here is read as staff. What the rest of the tool takes from it is ",
+    "the code and the name a class is known by."));
+
+  if (!state.courses.length) {
+    panel.append(el("p", { class: "empty", text: "No courses yet. Import an export above." }));
+    wrap.append(panel);
+    return wrap;
+  }
+
+  const semesters = [...new Set(state.courses.map((c) => c.semester).filter(Boolean))].sort();
+  const timetabled = new Set(state.timetable.map((r) => r.course_code));
+
+  const controls = el("div", { class: "toolbar" },
+    el("input", {
+      type: "search", value: courseQuery, placeholder: "Find a code, name or person",
+      class: "search",
+      oninput: (e) => { courseQuery = e.target.value; renderCourseTable(); },
+    }));
+
+  if (semesters.length > 1) {
+    controls.append(el("span", { class: "caption", text: "Semester" }));
+    controls.append(el("button", {
+      class: courseSemester === "" ? "pill on" : "pill", text: "any",
+      onclick: () => { courseSemester = ""; render(); },
+    }));
+    for (const s of semesters) {
+      controls.append(el("button", {
+        class: courseSemester === s ? "pill on" : "pill", text: s,
+        onclick: () => { courseSemester = s; render(); },
+      }));
+    }
+  }
+  panel.append(controls);
+
+  const holder = el("div", { id: "coursetable" });
+  panel.append(holder);
+  wrap.append(panel);
+
+  // Rendered separately so typing in the search box does not rebuild the page
+  // and lose the caret.
+  function renderCourseTable() {
+    const needle = courseQuery.trim().toLowerCase();
+    const matches = state.courses.filter((c) => {
+      if (courseSemester && c.semester !== courseSemester) return false;
+      if (!needle) return true;
+      return [c.code, c.name, c.coordinator, c.offering_coordinator,
+              c.department, c.programme]
+        .some((v) => (v || "").toLowerCase().includes(needle));
+    });
+
+    const table = el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "Code" }), el("th", { text: "Name" }),
+        el("th", { text: "Year" }), el("th", { text: "Sem" }),
+        el("th", { text: "Occ" }), el("th", { text: "Coordinator" }),
+        el("th", { text: "Timetabled" }))));
+
+    const body = el("tbody");
+    for (const c of matches.slice(0, COURSE_PAGE)) {
+      body.append(el("tr", {},
+        el("td", {}, el("strong", { text: c.code })),
+        el("td", {}, c.name,
+          c.programme ? el("div", { class: "muted", text: c.programme }) : null),
+        el("td", { class: "muted", text: c.academic_year || "—" }),
+        el("td", { class: "muted", text: c.semester || "—" }),
+        el("td", { class: "muted", text: c.occurrence || "—" }),
+        el("td", {}, c.coordinator || el("span", { class: "muted", text: "—" }),
+          c.coordinator_email
+            ? el("div", { class: "muted", text: c.coordinator_email })
+            : null),
+        el("td", {},
+          timetabled.has(c.code)
+            ? el("span", { class: "flag", text: "in the timetable" })
+            : el("span", { class: "muted", text: "—" }))));
+    }
+    table.append(body);
+
+    holder.replaceChildren(
+      table,
+      matches.length > COURSE_PAGE
+        ? el("p", { class: "muted", text:
+            `Showing ${COURSE_PAGE} of ${matches.length}. Narrow the search to see the rest.` })
+        : el("p", { class: "muted", text:
+            `${matches.length} of ${state.courses.length} courses.` }));
+  }
+
+  renderCourseTable();
+  return wrap;
+}
+
+function coursesImportPanel() {
+  const panel = el("section", { class: "panel" },
+    el("h2", { text: "Import a course export" }));
+
+  panel.append(el("p", { class: "hint" },
+    "The export from the student management system, as CSV or Excel. It needs a ",
+    "header row with at least a course code and a course name; the rest of the ",
+    "columns are taken if they are there. A course that runs in two semesters is ",
+    "two rows, and stays two records."));
+
+  panel.append(el("div", { class: "toolbar" },
+    el("input", {
+      type: "file", id: "coursefile", accept: ".csv,.tsv,.xlsx,.xlsm",
+      onchange: (e) => previewCourses(e.target.files[0]),
+    })));
+
+  if (!coursePreview) return panel;
+
+  const { rows, issues } = coursePreview;
+
+  if (issues.length) {
+    panel.append(el("div", { class: "issues" },
+      el("strong", { text: issues.length === 1
+        ? "One row could not be read" : `${issues.length} rows could not be read` }),
+      el("ul", {}, issues.slice(0, 10).map((i) => el("li", { text: i }))),
+      issues.length > 10
+        ? el("p", { class: "muted", text: `and ${issues.length - 10} more.` })
+        : null));
+  }
+
+  if (rows.length) {
+    panel.append(el("p", {},
+      el("strong", { text: `${rows.length} courses read.` }),
+      ` ${coursePreview.new} new, ${coursePreview.updating} already held`,
+      coursePreview.semesters.length
+        ? `, covering ${coursePreview.semesters.join(" and ")}.`
+        : "."));
+
+    const table = el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "Code" }), el("th", { text: "Name" }),
+        el("th", { text: "Year" }), el("th", { text: "Sem" }),
+        el("th", { text: "Coordinator" }))));
+    const body = el("tbody");
+    for (const row of rows.slice(0, 20)) {
+      body.append(el("tr", {},
+        el("td", { text: row.code }),
+        el("td", { text: row.name }),
+        el("td", { class: "muted", text: row.academic_year }),
+        el("td", { class: "muted", text: row.semester }),
+        el("td", { class: "muted", text: row.coordinator })));
+    }
+    table.append(body);
+    panel.append(table);
+    if (rows.length > 20) {
+      panel.append(el("p", { class: "muted", text: `and ${rows.length - 20} more.` }));
+    }
+
+    panel.append(el("div", { class: "toolbar" },
+      el("button", {
+        class: "action primary", text: "Add these to the catalogue",
+        onclick: () => commitCourses("merge"),
+      }),
+      el("button", {
+        class: "action", text: "Replace the whole catalogue",
+        onclick: () => commitCourses("replace"),
+      }),
+      el("button", {
+        class: "link", text: "Cancel",
+        onclick: () => { coursePreview = null; render(); },
+      })));
+  }
+
+  return panel;
+}
+
+async function previewCourses(file) {
+  if (!file) return;
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    coursePreview = await api("POST", "/api/courses/import/preview", form);
+    render();
+  } catch (error) {
+    coursePreview = null;
+    toast(error.message, true);
+    render();
+  }
+}
+
+async function commitCourses(mode) {
+  if (mode === "replace") {
+    const ok = await confirmDialog(
+      "Replace the whole catalogue?",
+      `The ${coursePreview.holding} courses held now will be deleted and replaced by ` +
+      `${coursePreview.rows.length} from the file. An export is often one semester, ` +
+      `so anything not in this file goes.`);
+    if (!ok) return;
+  }
+  try {
+    const result = await api("POST", "/api/courses/import/commit",
+      { rows: coursePreview.rows, mode });
+    coursePreview = null;
+    const input = $("#coursefile");
+    if (input) input.value = "";
+    toast(`${result.added} added, ${result.updated} updated`
+      + (result.removed ? `, ${result.removed} removed.` : "."));
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 // ------------------------------------------------------------ setup
 
 function setupView() {
@@ -873,6 +1266,7 @@ function setupView() {
   }
   wrap.append(staffPanel);
 
+  wrap.append(offeringPanel());
   wrap.append(importPanel());
 
   // weeks
@@ -938,6 +1332,62 @@ function setupView() {
   return wrap;
 }
 
+function offeringPanel() {
+  const settings = state.settings || { academic_year: "", semester: "" };
+  const semesters = [...new Set(state.courses.map((c) => c.semester).filter(Boolean))].sort();
+  const years = [...new Set(state.courses.map((c) => c.academic_year).filter(Boolean))].sort();
+
+  const panel = el("section", { class: "panel" },
+    el("h2", { text: "What you are planning" }));
+
+  panel.append(el("p", { class: "hint" },
+    "The year and semester this timetable is for. Setting it is optional; it is ",
+    "used to say when a timetabled class is not an offering in the semester you ",
+    "are planning, which usually means the wrong course code."));
+
+  const yearInput = el("input", {
+    id: "set-year", type: "text", value: settings.academic_year || "",
+    placeholder: years[0] || "2027", list: "set-year-list", style: "max-width: 9rem",
+  });
+  const yearList = el("datalist", { id: "set-year-list" },
+    years.map((y) => el("option", { value: y })));
+
+  const semInput = el("input", {
+    id: "set-sem", type: "text", value: settings.semester || "",
+    placeholder: semesters[0] || "S1FS", list: "set-sem-list", style: "max-width: 9rem",
+  });
+  const semList = el("datalist", { id: "set-sem-list" },
+    semesters.map((s) => el("option", { value: s })));
+
+  panel.append(el("div", { class: "toolbar" },
+    el("label", { class: "inline" }, el("span", { text: "Academic year" }), yearInput, yearList),
+    el("label", { class: "inline" }, el("span", { text: "Semester" }), semInput, semList),
+    el("button", {
+      class: "action", text: "Save",
+      onclick: async () => {
+        try {
+          await api("PUT", "/api/settings", {
+            academic_year: val("set-year"), semester: val("set-sem"),
+          });
+          toast("Saved.");
+          await refresh();
+        } catch (error) { toast(error.message, true); }
+      },
+    }),
+    settings.academic_year || settings.semester
+      ? el("button", {
+          class: "link", text: "Clear",
+          onclick: async () => {
+            await api("PUT", "/api/settings", { academic_year: "", semester: "" });
+            toast("Cleared.");
+            await refresh();
+          },
+        })
+      : null));
+
+  return panel;
+}
+
 // ------------------------------------------------------------ import
 
 let importPreview = null;
@@ -948,8 +1398,9 @@ function importPanel() {
 
   panel.append(el("p", { class: "hint" },
     "A CSV or Excel file with a header row and columns for course code, section, ",
-    "day, start, end and weeks. Weeks can be written 1-6, 8, 10-12. Staffing is ",
-    "kept wherever the same class still runs in the same week."));
+    "day, start, end and weeks. Weeks can be written 1-6, 8, 10-12. Course names ",
+    "are not read from here: they come from the catalogue on the Courses page. ",
+    "Staffing is kept wherever the same class still runs in the same week."));
 
   panel.append(el("div", { class: "toolbar" },
     el("input", {
@@ -1185,6 +1636,23 @@ function field(label, input) {
   return el("label", { class: "field" }, el("span", { text: label }), input);
 }
 
+function courseInput(id, value) {
+  const listId = `${id}-list`;
+  const input = el("input", {
+    id, value: value ?? "", type: "text", list: listId,
+    placeholder: state.courses.length ? state.courses[0].code : "133150",
+  });
+  const list = el("datalist", { id: listId });
+  const seen = new Set();
+  for (const course of state.courses) {
+    if (seen.has(course.code)) continue;
+    seen.add(course.code);
+    list.append(el("option", { value: course.code }, course.name));
+  }
+  return el("span", { class: "picker" }, input, list);
+}
+
+
 function textInput(id, value, opts = {}) {
   return el("input", { id, value: value ?? "", type: opts.type || "text",
                        placeholder: opts.placeholder || "" });
@@ -1260,22 +1728,22 @@ const orNull = (id) => val(id) || null;
 
 function editTimetable(row) {
   const fields = [
-    field("Course code", textInput("tt-code", row?.course_code, { placeholder: "111.701" })),
-    field("Course title", textInput("tt-title", row?.course_title)),
+    field("Course", courseInput("tt-code", row?.course_code)),
     field("Section", textInput("tt-section", row?.section, { placeholder: "A" })),
     field("Day", daySelect("tt-day", row?.day || "Monday")),
     field("Starts", textInput("tt-start", row?.start || "09:00", { type: "time" })),
     field("Ends", textInput("tt-end", row?.end || "11:00", { type: "time" })),
     field("Weeks", weekTicks("tt-weeks", row?.weeks || weekNumbers())),
     el("p", { class: "hint" },
-      "The timetable is set outside this tool, so this is for corrections. Who ",
-      "teaches it is decided on the Planner."),
+      "The timetable is set outside this tool, so this is for corrections. The ",
+      "course name comes from the catalogue, and who teaches it is decided on ",
+      "the Planner."),
   ];
 
   openEditor(row ? `${row.course_code} ${row.section}` : "A class", fields,
     () => {
       const body = {
-        course_code: val("tt-code"), course_title: val("tt-title"),
+        course_code: val("tt-code"),
         section: val("tt-section"), day: val("tt-day"),
         start: val("tt-start"), end: val("tt-end"),
         weeks: ticked("tt-weeks"),
@@ -1375,6 +1843,7 @@ const VIEWS = {
   planner: plannerView,
   staff: staffView,
   load: loadView,
+  courses: coursesView,
   exceptions: exceptionsView,
   setup: setupView,
 };
@@ -1388,6 +1857,8 @@ function go(view) {
     openRow = null;
     assignScope = null;
     candidates = null;
+    coursePreview = null;
+    importPreview = null;
   }
   location.hash = view;
   render();

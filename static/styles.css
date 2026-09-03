@@ -424,42 +424,87 @@ table input:focus { border-color: var(--focus); background: var(--surface); }
 
 /* ------------------------------------------------------------ staff view */
 
-.weeks {
-  display: grid;
-  gap: 0.6rem;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+.people { display: grid; gap: 1rem; grid-template-columns: 1fr; }
+@media (min-width: 1000px) { .people { grid-template-columns: 1fr 1fr; } }
+
+.person h2 { display: flex; align-items: baseline; }
+.usual-weeks { font-size: 0.82rem; margin-bottom: 0.4rem; }
+
+.weekgrid { display: flex; }
+
+.gutterwrap { width: 26px; flex: none; }
+.gutterhead { height: 21px; }
+.gutter { position: relative; }
+.gutter .hour {
+  position: absolute; right: 0; margin-top: -0.5em;
+  font-size: 0.72rem; color: var(--quiet); padding-right: 5px;
 }
 
-.week {
-  border: 1px solid var(--rule-soft);
-  border-radius: 6px;
-  padding: 0.5rem 0.6rem;
-  background: var(--surface);
+.gridcols { flex: 1; display: grid; }
+
+.dayhead {
+  font-size: 0.7rem; font-weight: 620; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--quiet);
+  padding-bottom: 4px; border-bottom: 1px solid var(--rule);
 }
 
-.week-head {
-  display: flex;
-  align-items: baseline;
-  gap: 0.4rem;
-  margin-bottom: 0.35rem;
-  flex-wrap: wrap;
-}
-.week-head .note { flex-basis: 100%; font-size: 0.78rem; }
+.col { position: relative; border-right: 1px solid var(--rule-soft); }
+.col:last-child { border-right: none; }
+.rule { position: absolute; left: 0; right: 0; height: 1px; background: var(--rule-soft); }
 
-.klass {
-  border-left: 3px solid var(--quiet);
-  background: var(--paper);
-  border-radius: 0 4px 4px 0;
-  padding: 0.25rem 0.5rem;
-  margin-bottom: 0.3rem;
-  font-size: 0.83rem;
+.blk {
+  position: absolute; left: 2px; right: 3px;
+  border-radius: 3px; border-left: 3px solid var(--quiet);
+  padding: 1px 5px; overflow: hidden; line-height: 1.25;
 }
-.klass-label { font-weight: 620; }
-.klass.changed   { background: var(--changed-wash); }
-.klass.added     { background: #eef6f2; }
-.klass.cancelled { background: var(--rule-soft); color: var(--quiet); }
-.klass.cancelled .klass-label { text-decoration: line-through; }
-.klass.clash     { background: var(--clash-wash); border-left-color: var(--clash) !important; }
+.blk-label { display: block; font-size: 0.75rem; font-weight: 620; }
+.blk-when  { display: block; font-size: 0.7rem; color: var(--ink-soft); }
+.blk-title {
+  display: block; font-size: 0.7rem; color: var(--quiet);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.blk.clash {
+  background: var(--clash-wash) !important;
+  border-left-color: var(--clash) !important;
+}
+
+.settled { padding-top: 0.6rem; font-size: 0.83rem; }
+
+.departures { padding-top: 0.7rem; }
+.dep {
+  display: flex; gap: 0.7rem; align-items: baseline;
+  padding: 0.3rem 0; border-top: 1px solid var(--rule-soft);
+  font-size: 0.85rem;
+}
+.dep-weeks { font-weight: 620; white-space: nowrap; min-width: 6.4rem; }
+.dep-what { flex: 1; }
+
+.caption {
+  font-size: 0.72rem; font-weight: 620; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--quiet);
+}
+
+/* the clash panel still names classes inline */
+.klass { font-weight: 620; }
+
+/* ------------------------------------------------------------ courses */
+
+.search {
+  font: inherit; padding: 0.28rem 0.5rem; border: 1px solid var(--rule);
+  border-radius: 5px; background: var(--surface); min-width: 16rem;
+}
+
+.picker { display: block; }
+.picker input { width: 100%; }
+
+label.inline {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  font-size: 0.85rem; color: var(--ink-soft);
+}
+label.inline input {
+  font: inherit; padding: 0.28rem 0.45rem; border: 1px solid var(--rule);
+  border-radius: 5px; background: var(--surface);
+}
 
 /* ------------------------------------------------------------ load */
 

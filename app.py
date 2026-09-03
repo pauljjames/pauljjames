@@ -36,7 +36,7 @@ HERE = Path(__file__).parent
 # every load, but the routes live in this process, so an unrestarted server
 # serves a new front end against old endpoints. The front end compares this
 # against its own copy and says so rather than failing with a bare 404.
-VERSION = "2026-09-01.1"
+VERSION = "2026-09-03.1"
 
 
 @contextmanager
@@ -71,7 +71,6 @@ class StaffIn(BaseModel):
 
 class TimetableIn(BaseModel):
     course_code: str
-    course_title: str = ""
     section: str
     day: str
     start: str
@@ -120,6 +119,16 @@ class CommitIn(BaseModel):
     mode: str = "replace"
 
 
+class CourseCommitIn(BaseModel):
+    rows: list[dict]
+    mode: str = "merge"          # merge updates in place; replace wipes first
+
+
+class SettingsIn(BaseModel):
+    academic_year: str = ""
+    semester: str = ""
+
+
 # ------------------------------------------------------------ serialisation
 
 def week_json(w: engine.Week) -> dict:
@@ -140,11 +149,29 @@ def staff_json(s: engine.StaffMember) -> dict:
     }
 
 
+def course_json(c: engine.Course) -> dict:
+    return {
+        "code": c.code,
+        "name": c.name,
+        "academic_year": c.academic_year,
+        "semester": c.semester,
+        "occurrence": c.occurrence,
+        "college": c.college,
+        "programme": c.programme,
+        "coordinator": c.coordinator,
+        "coordinator_email": c.coordinator_email,
+        "offering_coordinator": c.offering_coordinator,
+        "offering_coordinator_email": c.offering_coordinator_email,
+        "grade_reviewer": c.grade_reviewer,
+        "grade_reviewer_email": c.grade_reviewer_email,
+        "department": c.department,
+    }
+
+
 def timetable_json(r: engine.TimetableRow) -> dict:
     return {
         "id": r.id,
         "course_code": r.course_code,
-        "course_title": r.course_title,
         "section": r.section,
         "day": r.day,
         "start": store.from_time(r.start),
@@ -196,14 +223,44 @@ def conflict_json(c: engine.Conflict) -> dict:
     }
 
 
+def shape_json(s: engine.Shape) -> dict:
+    return {
+        "staff_id": s.staff_id,
+        "usual": [class_json(c) for c in s.usual],
+        "usual_weeks": list(s.usual_weeks),
+        "settled": s.is_settled,
+        "minutes": s.minutes,
+        "departures": [
+            {
+                "weeks": list(d.weeks),
+                "classes": [class_json(c) for c in d.classes],
+                "added": [class_json(c) for c in d.added],
+                "gone": [class_json(c) for c in d.gone],
+                "cancelled": [class_json(c) for c in d.cancelled],
+                "moved": [
+                    {"usually": class_json(a), "instead": class_json(b)}
+                    for a, b in d.moved
+                ],
+            }
+            for d in s.departures
+        ],
+    }
+
+
+def planning_from(settings: dict) -> tuple[str, str] | None:
+    year, semester = settings.get("academic_year", ""), settings.get("semester", "")
+    return (year, semester) if year and semester else None
+
+
 # ------------------------------------------------------------ routes
 
 @app.get("/api/state")
 def state() -> dict:
     with db() as conn:
-        weeks, staff, timetable, exceptions, assignments = store.load_all(conn)
+        weeks, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
+        settings = store.get_settings(conn)
 
-    classes = engine.expand(timetable, exceptions, assignments)
+    classes = engine.expand(timetable, exceptions, assignments, courses)
     cover = engine.coverage(classes)
     problems = engine.find_problems(classes)
 
@@ -256,7 +313,19 @@ def state() -> dict:
             }
             for p in problems
         ],
-        "issues": engine.validate(weeks, staff, timetable, exceptions, assignments),
+        "courses": [course_json(c) for c in courses],
+        "settings": {
+            "academic_year": settings.get("academic_year", ""),
+            "semester": settings.get("semester", ""),
+        },
+        "shapes": [
+            shape_json(s)
+            for s in engine.shapes(classes, staff, [w.number for w in weeks])
+        ],
+        "issues": engine.validate(
+            weeks, staff, timetable, exceptions, assignments,
+            courses, planning_from(settings),
+        ),
     }
 
 
@@ -268,9 +337,9 @@ def availability(body: AvailabilityIn) -> dict:
     take a class is visibly unavailable rather than a refusal after the fact.
     """
     with db() as conn:
-        _, staff, timetable, exceptions, assignments = store.load_all(conn)
+        _, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
 
-    classes = engine.expand(timetable, exceptions, assignments)
+    classes = engine.expand(timetable, exceptions, assignments, courses)
     busy = engine.who_is_free(
         classes,
         [s.id for s in staff],
@@ -306,7 +375,7 @@ def assign(body: AssignIn) -> dict:
     that would create it does not happen.
     """
     with db() as conn:
-        _, staff, timetable, exceptions, assignments = store.load_all(conn)
+        _, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
 
         if body.staff_id not in {s.id for s in staff}:
             raise HTTPException(400, f"There is no staff member {body.staff_id}.")
@@ -326,7 +395,7 @@ def assign(body: AssignIn) -> dict:
         if not weeks:
             raise HTTPException(400, "No weeks were given.")
 
-        classes = engine.expand(timetable, exceptions, assignments)
+        classes = engine.expand(timetable, exceptions, assignments, courses)
 
         conflicts = engine.check_assignment(
             classes, body.staff_id, timetable_id=body.timetable_id, weeks=weeks
@@ -413,7 +482,7 @@ async def import_preview(file: UploadFile = File(...)) -> dict:
         raise HTTPException(400, str(exc))
 
     with db() as conn:
-        _, _, timetable, _, assignments = store.load_all(conn)
+        _, _, timetable, _, assignments, _ = store.load_all(conn)
 
     by_id = {r.id: r for r in timetable}
     incoming = {
@@ -460,6 +529,57 @@ def import_commit(body: CommitIn) -> dict:
         result = store.replace_timetable(conn, body.rows)
 
     return {"ok": True, "added": len(body.rows), **result}
+
+
+@app.post("/api/courses/import/preview")
+async def course_preview(file: UploadFile = File(...)) -> dict:
+    """Read a course export and say what it would change. Nothing is written."""
+    data = await file.read()
+    try:
+        rows, issues = importer.parse_courses(file.filename or "", data)
+    except importer.ImportError_ as exc:
+        raise HTTPException(400, str(exc))
+
+    with db() as conn:
+        existing = {c.key for c in store.get_courses(conn)}
+
+    incoming = [
+        (r["code"], r["academic_year"], r["semester"], r["occurrence"]) for r in rows
+    ]
+    return {
+        "rows": rows,
+        "issues": issues,
+        "holding": len(existing),
+        "new": sum(1 for key in incoming if key not in existing),
+        "updating": sum(1 for key in incoming if key in existing),
+        "semesters": sorted({r["semester"] for r in rows if r["semester"]}),
+    }
+
+
+@app.post("/api/courses/import/commit")
+def course_commit(body: CourseCommitIn) -> dict:
+    """Write catalogue rows. Merging updates in place; replacing wipes first."""
+    if not body.rows:
+        raise HTTPException(400, "There is nothing to import.")
+    with db() as conn:
+        result = store.save_courses(conn, body.rows, replace=body.mode == "replace")
+    return {"ok": True, **result}
+
+
+@app.delete("/api/courses/{code}")
+def del_course(code: str, academic_year: str = "", semester: str = "",
+               occurrence: str = "") -> dict:
+    with db() as conn:
+        store.delete_course(conn, code, academic_year, semester, occurrence)
+    return {"ok": True}
+
+
+@app.put("/api/settings")
+def put_settings(body: SettingsIn) -> dict:
+    """Which offering the manager is planning. Both blank means do not narrow."""
+    with db() as conn:
+        store.set_settings(conn, body.model_dump())
+    return {"ok": True}
 
 
 # ------------------------------------------------------------ records
@@ -554,7 +674,7 @@ def _refuse_conflicting_add(conn, body: ExceptionIn, row_id: int | None = None) 
     if body.action != engine.Action.ADD.value or not body.staff_id:
         return
 
-    _, staff, timetable, exceptions, assignments = store.load_all(conn)
+    _, staff, timetable, exceptions, assignments, courses = store.load_all(conn)
     if body.staff_id not in {s.id for s in staff}:
         raise HTTPException(400, f"There is no staff member {body.staff_id}.")
     if not (body.day and body.start and body.end):
@@ -572,7 +692,7 @@ def _refuse_conflicting_add(conn, body: ExceptionIn, row_id: int | None = None) 
         end=store.to_time(body.end),
         staff_id=body.staff_id,
     )
-    classes = engine.expand(timetable, others + [proposed], assignments)
+    classes = engine.expand(timetable, others + [proposed], assignments, courses)
     conflicts = engine.check_assignment(classes, body.staff_id, exception_id=-1)
     if conflicts:
         raise HTTPException(

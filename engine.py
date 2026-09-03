@@ -9,6 +9,8 @@ The model, in short:
 
   Week          one teaching week, numbered 1..n, with real dates attached
   StaffMember   someone the manager staffs, with an optional weekly target
+  Course        one offering out of the student management system: its code,
+                name, year, semester and the people accountable for it
   TimetableRow  a course and section, its day, time, and the weeks it runs.
                 Set externally. It does not say who teaches it.
   Assignment    one person covering one timetable row in one week
@@ -74,10 +76,46 @@ class StaffMember:
 
 
 @dataclass(frozen=True)
+class Course:
+    """One offering, as the student management system has it.
+
+    This is a catalogue, not a plan: most of what it holds is accountability
+    rather than teaching. A course coordinator is not the person in the room,
+    so nothing here is read as staffing. What the rest of the tool takes from
+    it is identity, the code and the name a class is known by.
+
+    Identity is the whole offering, not the code alone: one code can run in
+    both semesters, and those are different offerings of the same course.
+    """
+
+    code: str
+    name: str = ""
+    academic_year: str = ""
+    semester: str = ""
+    occurrence: str = ""
+    college: str = ""
+    programme: str = ""
+    coordinator: str = ""
+    coordinator_email: str = ""
+    offering_coordinator: str = ""
+    offering_coordinator_email: str = ""
+    grade_reviewer: str = ""
+    grade_reviewer_email: str = ""
+    department: str = ""
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.code, self.academic_year, self.semester, self.occurrence)
+
+    @property
+    def label(self) -> str:
+        return f"{self.code} {self.name}".strip()
+
+
+@dataclass(frozen=True)
 class TimetableRow:
     id: int
     course_code: str
-    course_title: str
     section: str
     day: str
     start: time
@@ -219,6 +257,46 @@ class Problem:
 
 
 @dataclass(frozen=True)
+class Departure:
+    """A set of weeks that does not look like the person's usual week.
+
+    It carries both the whole week and the difference, because a reader wants
+    the difference ("also teaching X") and a renderer sometimes wants the week.
+    """
+
+    weeks: tuple[int, ...]
+    classes: tuple[Class, ...]
+    added: tuple[Class, ...]                       # not in the usual week
+    gone: tuple[Class, ...]                        # in the usual week, not here
+    moved: tuple[tuple[Class, Class], ...]         # (usually, this week)
+    cancelled: tuple[Class, ...]
+
+
+@dataclass(frozen=True)
+class Shape:
+    """One person's semester as the week they repeat, and the weeks that depart.
+
+    A twelve week semester is rarely twelve different weeks. It is usually one
+    week repeated, with a handful of exceptions, and saying it that way is the
+    difference between a page somebody reads and a page they scroll past.
+    """
+
+    staff_id: str
+    usual: tuple[Class, ...]
+    usual_weeks: tuple[int, ...]
+    departures: tuple[Departure, ...]
+
+    @property
+    def is_settled(self) -> bool:
+        """Every week the same. Nothing to say beyond the grid."""
+        return not self.departures
+
+    @property
+    def minutes(self) -> int:
+        return sum(c.minutes for c in self.usual)
+
+
+@dataclass(frozen=True)
 class Coverage:
     """How much of the timetable has somebody on it."""
 
@@ -249,12 +327,26 @@ def overlaps(a: Class, b: Class) -> bool:
     return _collides(a.start, a.end, b.start, b.end)
 
 
+def course_names(courses: list[Course]) -> dict[str, str]:
+    """Code to name. A course keeps its name across offerings, so the code is enough."""
+    names: dict[str, str] = {}
+    for course in courses:
+        if course.name and not names.get(course.code):
+            names[course.code] = course.name
+    return names
+
+
 def expand(
     timetable: list[TimetableRow],
     exceptions: list[ExceptionRow],
     assignments: list[Assignment],
+    courses: list[Course] | None = None,
 ) -> list[Class]:
     """Build every class in every week, with its staffing and exceptions applied.
+
+    Names come from the course catalogue rather than the timetable, so there is
+    one place a course is named. A class whose code is not in the catalogue
+    still expands; it simply has no name, and validate() says so.
 
     A cancelled class keeps whoever was assigned to it, so the interface can say
     "Alice, cancelled" rather than dropping the week out of her semester with no
@@ -268,6 +360,7 @@ def expand(
         overrides.setdefault(exc.key, exc)
 
     staffing = {(a.timetable_id, a.week): a.staff_id for a in assignments}
+    names = course_names(courses or [])
 
     classes: list[Class] = []
 
@@ -276,7 +369,7 @@ def expand(
             base = Class(
                 week=week,
                 course_code=row.course_code,
-                course_title=row.course_title,
+                course_title=names.get(row.course_code, ""),
                 section=row.section,
                 staff_id=staffing.get((row.id, week)),
                 day=row.day,
@@ -310,7 +403,6 @@ def expand(
                 )
             )
 
-    titles = {r.course_code: r.course_title for r in timetable}
     for exc in exceptions:
         if exc.action is not Action.ADD:
             continue
@@ -318,7 +410,7 @@ def expand(
             Class(
                 week=exc.week,
                 course_code=exc.course_code,
-                course_title=titles.get(exc.course_code, ""),
+                course_title=names.get(exc.course_code, ""),
                 section=exc.section,
                 staff_id=exc.staff_id,
                 day=exc.day,
@@ -493,6 +585,98 @@ def uncovered_rows(classes: list[Class]) -> list[dict]:
     return rows
 
 
+def _in_order(group: list[Class]) -> list[Class]:
+    return sorted(group, key=lambda c: (
+        WEEKDAYS.index(c.day) if c.day in WEEKDAYS else len(WEEKDAYS),
+        _minutes(c.start) if c.start else 0,
+        c.label,
+    ))
+
+
+def _source(c: Class) -> tuple[str, int | None]:
+    """What a class IS, for telling one week's classes against another's.
+
+    Not the label: an added session carries the same course and section as the
+    class it sits beside, so matching on the label would fold an extra crit into
+    the studio it is extra to.
+    """
+    if c.timetable_row_id is not None:
+        return ("row", c.timetable_row_id)
+    return ("added", c.exception_id)
+
+
+def _signature(group: list[Class]) -> tuple:
+    """What makes two weeks the same week, for this purpose."""
+    return tuple(sorted(
+        (
+            c.label,
+            c.day or "",
+            "" if c.start is None else c.start.isoformat(),
+            "" if c.end is None else c.end.isoformat(),
+            c.status.value,
+        )
+        for c in group
+    ))
+
+
+def usual_week(classes: list[Class], staff_id: str, weeks: list[int]) -> Shape:
+    """The week this person repeats, and every week that departs from it.
+
+    The usual week is the one they have most often; ties go to whichever starts
+    earlier, so the answer does not wander between runs. A week where they teach
+    nothing is a week like any other and can itself be the usual one.
+    """
+    by_week: dict[int, list[Class]] = {w: [] for w in weeks}
+    for c in classes:
+        if c.staff_id == staff_id and c.week in by_week:
+            by_week[c.week].append(c)
+
+    if not by_week:
+        return Shape(staff_id=staff_id, usual=(), usual_weeks=(), departures=())
+
+    patterns: dict[tuple, list[int]] = {}
+    for week in sorted(by_week):
+        patterns.setdefault(_signature(by_week[week]), []).append(week)
+
+    ranked = sorted(patterns.items(), key=lambda item: (-len(item[1]), item[1][0]))
+    _, usual_weeks = ranked[0]
+    usual = tuple(_in_order(by_week[usual_weeks[0]]))
+    usually = {_source(c): c for c in usual}
+
+    departures = []
+    for _, weeks_here in ranked[1:]:
+        group = _in_order(by_week[weeks_here[0]])
+        here = {_source(c): c for c in group}
+        departures.append(Departure(
+            weeks=tuple(weeks_here),
+            classes=tuple(group),
+            added=tuple(c for c in group if c.runs and _source(c) not in usually),
+            gone=tuple(c for c in usual if _source(c) not in here),
+            moved=tuple(
+                (usually[_source(c)], c)
+                for c in group
+                if c.runs and _source(c) in usually
+                and (c.day, c.start, c.end) != (usually[_source(c)].day,
+                                                usually[_source(c)].start,
+                                                usually[_source(c)].end)
+            ),
+            cancelled=tuple(c for c in group if not c.runs),
+        ))
+
+    departures.sort(key=lambda d: d.weeks[0])
+    return Shape(
+        staff_id=staff_id,
+        usual=usual,
+        usual_weeks=tuple(usual_weeks),
+        departures=tuple(departures),
+    )
+
+
+def shapes(classes: list[Class], staff: list[StaffMember], weeks: list[int]) -> list[Shape]:
+    """Everybody's semester, each as a usual week and its departures."""
+    return [usual_week(classes, person.id, weeks) for person in staff]
+
+
 def find_clashes(classes: list[Class]) -> list[Clash]:
     """Every pair of classes the same person cannot both attend.
 
@@ -587,6 +771,8 @@ def validate(
     timetable: list[TimetableRow],
     exceptions: list[ExceptionRow],
     assignments: list[Assignment],
+    courses: list[Course] | None = None,
+    planning: tuple[str, str] | None = None,
 ) -> list[str]:
     """Problems with the data itself, as opposed to gaps in the staffing.
 
@@ -632,6 +818,39 @@ def validate(
                 f"week(s) {', '.join(str(w) for w in doubled)}. "
                 "This creates duplicate classes and false clashes."
             )
+
+    # Courses
+    catalogue = courses or []
+    seen_offerings: set[tuple[str, str, str, str]] = set()
+    for course in catalogue:
+        if course.key in seen_offerings:
+            issues.append(
+                f"Courses: {course.code} appears twice for the same year, "
+                "semester and occurrence."
+            )
+        seen_offerings.add(course.key)
+
+    # A timetable naming a course nobody has heard of is worth saying out loud:
+    # the class will have no name anywhere in the tool.
+    if catalogue:
+        known = {c.code for c in catalogue}
+        for code in sorted({r.course_code for r in timetable} - known):
+            issues.append(
+                f"{code}: not in the course list, so it has no name. "
+                "Import the course, or correct the code."
+            )
+
+        if planning:
+            year, semester = planning
+            running = {
+                c.code for c in catalogue
+                if c.academic_year == year and c.semester == semester
+            }
+            for code in sorted({r.course_code for r in timetable} & known - running):
+                issues.append(
+                    f"{code}: in the course list, but not as an offering in "
+                    f"{semester} {year}, which is what you are planning."
+                )
 
     # Assignments
     rows_by_id = {r.id: r for r in timetable}

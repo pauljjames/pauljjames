@@ -40,9 +40,20 @@ week. You set the Monday and the end of the week follows.
 contact hours a week, which is what the Load page and the utilisation bars
 measure against. It is optional.
 
+**Courses** is the catalogue, imported from the student management system. It
+is reference, not plan: most of what it holds is accountability rather than
+teaching, and nothing in it is read as staffing. A course coordinator is not
+the person in the room. What the rest of the tool takes from it is identity,
+the code and the name a class is known by. It will normally hold more courses
+than you timetable, which is fine.
+
+Identity is the whole offering, not the code alone: one code running in both
+semesters is two records.
+
 **Timetable** is one row per course and section: day, time, and the weeks it
-runs. It does not say who teaches it. Import it from the published spreadsheet
-and correct it by hand when the timetable is reissued.
+runs. It names neither the course nor the teacher. The name comes from the
+catalogue, the teacher is an assignment. Import it from the published
+spreadsheet and correct it by hand when the timetable is reissued.
 
 **Assignments** are who covers what, stored one record per class per week. A
 class split between two people is two sets of weeks on the same row, not a
@@ -88,11 +99,21 @@ by accident. Taking weeks somebody else holds asks first.
 The refusal is enforced in the API as well as shown in the interface, so it
 holds however the write arrives.
 
-**Staff** is one person's whole semester, week by week. Each class carries a
-colour down its left edge for the day it falls on, so a Monday and a Thursday
-commitment are distinguishable at a glance. No day is red, because red means a
-clash and nothing else. Amber means that week was changed, grey strikethrough
-means cancelled.
+**Staff** is each person's semester as the week they repeat, then only the
+weeks that depart from it. A twelve week semester is rarely twelve different
+weeks, and the version of this page that showed all of them ran to four
+thousand pixels of near identical cards with the few weeks that mattered lost
+among them.
+
+So each person gets one grid of their usual week, and underneath it a line per
+departure: a class cancelled, a class moved, an extra session, or a class that
+is somebody else's for those weeks. Every grid is drawn to the same scale, so
+two people can be compared. Colour down the left edge is the day, never the
+person, matching the day key at the foot of the page. No day is red, because
+red means a clash and nothing else.
+
+Which week counts as usual is the one held most often; a tie goes to whichever
+comes first, so the answer does not wander between visits.
 
 **Load** is contact hours per person per week, against their target. Timetabled
 minutes only, so it will not match a workload allocation that also covers
@@ -100,15 +121,48 @@ supervision, marking and admin.
 
 **Exceptions** lists every week that departs from the timetable.
 
-**Setup** holds staff, the teaching calendar, the timetable import, and the
-sample data controls.
+**Setup** holds staff, the teaching calendar, the timetable import, the year
+and semester you are planning, and the sample data controls.
 
-## Importing a timetable
+Naming the year and semester is optional. It is used for one thing: saying when
+a timetabled class is not an offering in the semester you are planning, which
+usually means a wrong course code.
+
+## Importing
+
+Both imports show a preview before anything is written, and both refuse a file
+they cannot read rather than importing half of it.
+
+### A course catalogue
+
+Courses takes the export from the student management system, as CSV or Excel.
+It needs a header row with at least a course code and a course name; every
+other column is taken if it is there:
+
+```
+Course Code, Academic Year, Semester, Occurrence, Course Name, College,
+Primary Programme, Course Coordinator, Course Coordinator Email,
+Offering Coordinator, Offering Coordinator Email, Grade Reviewer,
+Grade Reviewer Email, Offering Department
+```
+
+Codes arrive from a spreadsheet as numbers and are kept as codes: `133150`, not
+`133150.0`. The four coordinator columns are matched exactly, because
+`Course Coordinator` and `Course Coordinator Email` are two different things
+and folding them together would be worse than failing.
+
+*Add these to the catalogue* updates what it matches and adds the rest, so
+importing the same export twice changes nothing. *Replace the whole catalogue*
+deletes everything first, and asks before it does: an export is often one
+semester, and replacing would take the other one with it.
+
+### A timetable
 
 Setup takes a CSV or Excel file with a header row. It needs columns for course
-code, section, day, start, end and weeks; a course title is used if present.
-Headers are matched loosely, so `Course Code`, `course code` and `Code` are all
-understood, as are `Activity` or `Class` for the section.
+code, section, day, start, end and weeks. Course names are not read from here;
+they come from the catalogue. Headers are matched loosely, so `Course Code`,
+`course code` and `Code` are all understood, as are `Activity` or `Class` for
+the section.
 
 Weeks are written the way people write them: `1-12`, `1-6, 8`, `1-3 and 5`,
 `Weeks 7-9`. Times take `9:00`, `09:00`, `9.30`, `0900`, `1pm`, and whatever a
@@ -130,7 +184,9 @@ Above the Planner, Exceptions and Setup pages, an amber panel lists problems
 with the records rather than with the staffing: two rows covering the same
 section in one week, staff ids that do not exist, assignments to weeks a class
 does not run in, staffing written into an exception, incomplete added classes,
-backwards times.
+backwards times, a timetabled course that is not in the catalogue, and a course
+that is in the catalogue but not as an offering in the semester you are
+planning.
 
 The first of those is worth knowing about. Two rows covering the same section in
 the same week produces duplicate classes and a clash that is not real. It is the
@@ -140,8 +196,9 @@ name rather than silently absorbed.
 ## Layout
 
 ```
-engine.py     the rules: expansion, staffing, conflicts, coverage, load, validation
-importer.py   reading a timetable out of a spreadsheet
+engine.py     the rules: expansion, staffing, conflicts, coverage, load,
+              the usual week, validation
+importer.py   reading a timetable and a course catalogue out of spreadsheets
 store.py      SQLite, and nothing else
 app.py        HTTP, and nothing else
 seed.py       sample data
@@ -157,13 +214,20 @@ Apps or something else, the front end is replaceable and the rules are not.
 a person and a set of weeks, it returns what stands in the way. The interface
 uses it to grey people out, and the API uses it to refuse the write.
 
+`usual_week` is the other rule worth naming. It reduces a person's semester to
+the week they repeat plus a list of departures, and it belongs here rather than
+in the browser because deciding what makes two weeks the same week is a rule
+about timetables, not a rendering detail. It matches classes by where they come
+from rather than by their label, so an extra session of a course is a departure
+from the class it sits beside rather than the same thing counted twice.
+
 ## Tests
 
 ```
 python -m pytest
 ```
 
-122 tests. The engine cases came from two real course outlines: a lecture
+160 tests. The engine cases came from two real course outlines: a lecture
 running in three weeks only, workshops shortened in those weeks so the lecturer
 is not double booked, a public holiday cancellation, a one week substitution,
 split semester teaching, and an added crit session.
@@ -174,7 +238,16 @@ extending somebody's own class is not a clash with itself, a cancelled week
 does not block, a class moved out of the way stops blocking, an added class
 both blocks and is blocked, and unassigning frees the slot.
 
-Two of them are guards rather than features. One removes the exceptions and
+The usual week has its own tests, including the two cases that break a naive
+version: a six/six split, where the tie has to resolve the same way every time,
+and an added session sharing a course and section with the class beside it,
+which must not fold into it.
+
+The catalogue is tested for what a real export does: numeric codes, a course
+name with a comma in it, one code in two semesters, and the four coordinator
+columns staying apart.
+
+Two more are guards rather than features. One removes the exceptions and
 asserts that the clash reappears, so the shortened workshop test cannot pass by
 accident if clash detection stops working. The other checks that when a section
 appears twice in a week, only the class that actually collides is flagged.
@@ -193,6 +266,8 @@ short version is: restart `python app.py` after replacing any files.
   permissions.
 - One person per class per week. Team teaching would mean relaxing the
   assignment key and deciding what a clash means when two people share a slot.
+- The catalogue is read, never written back. Nothing here reaches the student
+  management system.
 - No notifications yet. The engine returns everything needed to build them.
 - All courses share one teaching calendar. If some run to a different pattern,
   weeks gain a calendar name and clash detection matches on calendar plus week.

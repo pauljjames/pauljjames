@@ -26,7 +26,6 @@ def test_a_plain_file_reads_straight_through():
     assert issues == []
     assert rows == [{
         "course_code": "111.701",
-        "course_title": "Design Studio",
         "section": "A",
         "day": "Tuesday",
         "start": "14:00",
@@ -96,7 +95,6 @@ def test_headers_are_matched_loosely():
     ))
     assert issues == []
     assert rows[0]["section"] == "Lecture"
-    assert rows[0]["course_title"] == "Design"
 
 
 def test_a_missing_column_is_named():
@@ -217,3 +215,131 @@ def test_a_spreadsheet_time_cell_is_understood():
     rows, issues = importer.parse("timetable.xlsx", buffer.getvalue())
     assert issues == []
     assert (rows[0]["start"], rows[0]["end"]) == ("14:00", "17:00")
+
+
+# ------------------------------------------------------------ the catalogue
+
+COURSE_HEADER = (
+    "Course Code,Academic Year,Semester,Occurrence,Course Name,College,"
+    "Primary Programme,Course Coordinator,Course Coordinator Email,"
+    "Offering Coordinator,Offering Coordinator Email,Grade Reviewer,"
+    "Grade Reviewer Email,Offering Department"
+)
+
+
+def test_a_real_export_reads_straight_through():
+    rows, issues = importer.parse_courses("courses.csv", csv_bytes(
+        COURSE_HEADER,
+        "133150,2027,S2FS,WLGI,Live Music Showcases,CCA College of Creative Arts,,"
+        "Andre Ktori,A.Ktori@massey.ac.nz,Dave Carter,D.Carter1@massey.ac.nz,,,"
+        "MU00693 - School of Music and Screen Arts",
+    ))
+    assert issues == []
+    assert rows[0] == {
+        "code": "133150",
+        "academic_year": "2027",
+        "semester": "S2FS",
+        "occurrence": "WLGI",
+        "name": "Live Music Showcases",
+        "college": "CCA College of Creative Arts",
+        "programme": "",
+        "coordinator": "Andre Ktori",
+        "coordinator_email": "A.Ktori@massey.ac.nz",
+        "offering_coordinator": "Dave Carter",
+        "offering_coordinator_email": "D.Carter1@massey.ac.nz",
+        "grade_reviewer": "",
+        "grade_reviewer_email": "",
+        "department": "MU00693 - School of Music and Screen Arts",
+    }
+
+
+def test_a_course_name_with_a_comma_survives():
+    rows, _ = importer.parse_courses("courses.csv", csv_bytes(
+        COURSE_HEADER,
+        '133154,2027,S2FS,WLGI,"Music, People, Places",CCA,UBCMS,Jon He,'
+        'J.He1@massey.ac.nz,Jon He,J.He1@massey.ac.nz,Dana Cameron,'
+        'D.Cameron@massey.ac.nz,MU00693',
+    ))
+    assert rows[0]["name"] == "Music, People, Places"
+
+
+def test_the_four_coordinator_columns_stay_apart():
+    """The bug worth guarding: they all start with the same words."""
+    rows, _ = importer.parse_courses("courses.csv", csv_bytes(
+        COURSE_HEADER,
+        "133154,2027,S2FS,WLGI,Music,CCA,UBCMS,Course Person,course@x.ac.nz,"
+        "Offering Person,offering@x.ac.nz,Reviewer Person,reviewer@x.ac.nz,MU00693",
+    ))
+    row = rows[0]
+    assert row["coordinator"] == "Course Person"
+    assert row["coordinator_email"] == "course@x.ac.nz"
+    assert row["offering_coordinator"] == "Offering Person"
+    assert row["offering_coordinator_email"] == "offering@x.ac.nz"
+    assert row["grade_reviewer"] == "Reviewer Person"
+    assert row["grade_reviewer_email"] == "reviewer@x.ac.nz"
+
+
+def test_one_code_in_two_semesters_is_two_courses():
+    rows, issues = importer.parse_courses("courses.csv", csv_bytes(
+        COURSE_HEADER,
+        "133150,2027,S1FS,WLGI,Live Music Showcases,CCA,,A,a@x,B,b@x,,,MU00693",
+        "133150,2027,S2FS,WLGI,Live Music Showcases,CCA,,A,a@x,B,b@x,,,MU00693",
+    ))
+    assert issues == []
+    assert [r["semester"] for r in rows] == ["S1FS", "S2FS"]
+
+
+def test_the_same_offering_twice_in_one_file_is_refused():
+    rows, issues = importer.parse_courses("courses.csv", csv_bytes(
+        COURSE_HEADER,
+        "133150,2027,S1FS,WLGI,Live Music Showcases,CCA,,A,a@x,B,b@x,,,MU00693",
+        "133150,2027,S1FS,WLGI,Live Music Showcases,CCA,,A,a@x,B,b@x,,,MU00693",
+    ))
+    assert len(rows) == 1
+    assert any("already on row 2" in i for i in issues)
+
+
+def test_a_row_with_no_course_code_is_left_out():
+    rows, issues = importer.parse_courses("courses.csv", csv_bytes(
+        COURSE_HEADER,
+        ",2027,S1FS,WLGI,Nameless,CCA,,A,a@x,B,b@x,,,MU00693",
+    ))
+    assert rows == []
+    assert any("no course code" in i for i in issues)
+
+
+def test_a_file_missing_the_code_or_name_column_says_so():
+    rows, issues = importer.parse_courses("courses.csv", csv_bytes(
+        "Semester,College", "S1FS,CCA",
+    ))
+    assert rows == []
+    assert "code" in issues[0] and "name" in issues[0]
+
+
+def test_a_numeric_course_code_out_of_a_spreadsheet_stays_a_code():
+    openpyxl = pytest.importorskip("openpyxl")
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.append(COURSE_HEADER.split(","))
+    sheet.append([133150, 2027, "S2FS", "WLGI", "Live Music Showcases", "CCA", "",
+                  "Andre Ktori", "A.Ktori@massey.ac.nz", "Dave Carter",
+                  "D.Carter1@massey.ac.nz", "", "", "MU00693"])
+    buffer = io.BytesIO()
+    book.save(buffer)
+
+    rows, issues = importer.parse_courses("courses.xlsx", buffer.getvalue())
+    assert issues == []
+    assert rows[0]["code"] == "133150"          # not 133150.0, not an int
+    assert rows[0]["academic_year"] == "2027"
+
+
+def test_courses_come_back_in_a_predictable_order():
+    rows, _ = importer.parse_courses("courses.csv", csv_bytes(
+        COURSE_HEADER,
+        "133175,2027,S1FS,WLGI,Music Practice 1,CCA,,A,a@x,B,b@x,,,MU00693",
+        "133150,2027,S2FS,WLGI,Live Music Showcases,CCA,,A,a@x,B,b@x,,,MU00693",
+        "133150,2027,S1FS,WLGI,Live Music Showcases,CCA,,A,a@x,B,b@x,,,MU00693",
+    ))
+    assert [(r["code"], r["semester"]) for r in rows] == [
+        ("133150", "S1FS"), ("133150", "S2FS"), ("133175", "S1FS"),
+    ]

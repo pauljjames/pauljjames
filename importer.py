@@ -1,4 +1,7 @@
-"""Reading an externally published timetable out of a spreadsheet.
+"""Reading spreadsheets that come from somewhere else.
+
+Two of them: the published timetable, and the course catalogue exported from
+the student management system.
 
 The timetable is not this tool's document. It arrives as a file, is corrected
 and reissued, and has to be read as it comes rather than as we would like it.
@@ -21,7 +24,6 @@ from engine import WEEKDAYS
 # Every spelling we will answer to, mapped to the field we mean.
 HEADERS = {
     "course_code": ("course code", "course", "code", "unit code", "module code"),
-    "course_title": ("course title", "title", "course name", "name", "unit", "module"),
     "section": ("section", "class", "group", "activity", "component", "type"),
     "day": ("day", "weekday", "day of week"),
     "start": ("start", "start time", "from", "begins"),
@@ -123,15 +125,22 @@ def _read_xlsx(data: bytes) -> list[list]:
 
 # ------------------------------------------------------------ headers
 
-def _map_headers(header: list) -> tuple[dict[str, int], list[str]]:
+def _map_headers(
+    header: list,
+    headers: dict | None = None,
+    required: tuple = (),
+) -> tuple[dict[str, int], list[str]]:
+    headers = headers if headers is not None else HEADERS
+    required = required or REQUIRED
+
     found: dict[str, int] = {}
     for index, cell in enumerate(header):
         label = _clean(cell).lower().replace("_", " ")
-        for field, spellings in HEADERS.items():
+        for field, spellings in headers.items():
             if field not in found and label in spellings:
                 found[field] = index
 
-    missing = [f for f in REQUIRED if f not in found]
+    missing = [f for f in required if f not in found]
     if missing:
         return {}, [
             "The file needs a header row with columns for "
@@ -150,6 +159,10 @@ def _cell(row: list, index: int):
 def _clean(value) -> str:
     if value is None:
         return ""
+    # A course code of 133150 comes back as a number, and 133150.0 is not a
+    # course code anybody would recognise.
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     return str(value).strip()
 
 
@@ -187,7 +200,6 @@ def _build(values: dict, line: int) -> tuple[dict, list[str]]:
 
     return {
         "course_code": code,
-        "course_title": _clean(values.get("course_title")),
         "section": section,
         "day": day,
         "start": start,
@@ -262,3 +274,79 @@ def _weeks(value) -> tuple[list[int], str | None]:
     if min(weeks) < 1:
         return [], "weeks start at 1."
     return sorted(weeks), None
+
+
+# ------------------------------------------------------------ the catalogue
+
+# The export from the student management system. Column names are matched the
+# same forgiving way as the timetable, but the spellings here are exact rather
+# than guessed at, because "Course Coordinator" and "Course Coordinator Email"
+# are two different columns and must not collapse into one.
+COURSE_HEADERS = {
+    "code": ("course code", "code", "course", "paper code"),
+    "name": ("course name", "name", "title", "course title", "paper name"),
+    "academic_year": ("academic year", "year"),
+    "semester": ("semester", "sem"),
+    "occurrence": ("occurrence", "occ"),
+    "college": ("college",),
+    "programme": ("primary programme", "primary program", "programme", "program"),
+    "coordinator": ("course coordinator", "coordinator"),
+    "coordinator_email": ("course coordinator email", "coordinator email"),
+    "offering_coordinator": ("offering coordinator",),
+    "offering_coordinator_email": ("offering coordinator email",),
+    "grade_reviewer": ("grade reviewer",),
+    "grade_reviewer_email": ("grade reviewer email",),
+    "department": ("offering department", "department", "school"),
+}
+
+COURSE_REQUIRED = ("code", "name")
+
+
+def parse_courses(filename: str, data: bytes) -> tuple[list[dict], list[str]]:
+    """Read a course catalogue export into rows ready for store.save_courses.
+
+    Nothing here is read as staffing. A course coordinator is an accountability,
+    not the person in the room, so these names are carried across as text and
+    never matched against staff.
+    """
+    name = (filename or "").lower()
+    table = _read_xlsx(data) if name.endswith((".xlsx", ".xlsm")) else _read_csv(data)
+    if not table:
+        raise ImportError_("The file is empty.")
+
+    header, *body = table
+    columns, header_issues = _map_headers(header, COURSE_HEADERS, COURSE_REQUIRED)
+    if header_issues:
+        return [], header_issues
+
+    rows: list[dict] = []
+    issues: list[str] = []
+    seen: dict[tuple, int] = {}
+
+    for offset, raw in enumerate(body):
+        line = offset + 2   # what a spreadsheet would call this row
+        if not any(str(cell).strip() for cell in raw if cell is not None):
+            continue
+
+        row = {
+            field: _clean(_cell(raw, index)) for field, index in columns.items()
+        }
+        for field in COURSE_HEADERS:
+            row.setdefault(field, "")
+
+        if not row["code"]:
+            issues.append(f"Row {line}: no course code.")
+            continue
+
+        key = (row["code"], row["academic_year"], row["semester"], row["occurrence"])
+        if key in seen:
+            issues.append(
+                f"Row {line}: {row['code']} is already on row {seen[key]} for the "
+                "same year, semester and occurrence."
+            )
+            continue
+        seen[key] = line
+        rows.append(row)
+
+    rows.sort(key=lambda r: (r["code"], r["academic_year"], r["semester"], r["occurrence"]))
+    return rows, issues

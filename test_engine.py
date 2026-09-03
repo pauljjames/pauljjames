@@ -15,6 +15,7 @@ import pytest
 from engine import (
     Action,
     Assignment,
+    Course,
     Class,
     ExceptionRow,
     StaffMember,
@@ -24,6 +25,7 @@ from engine import (
     check_assignment,
     classes_for,
     coverage,
+    course_names,
     expand,
     find_clashes,
     find_problems,
@@ -31,7 +33,9 @@ from engine import (
     load_by_staff,
     over_target,
     overlaps,
+    shapes,
     uncovered_rows,
+    usual_week,
     validate,
     who_is_free,
 )
@@ -48,11 +52,10 @@ def week(n: int) -> Week:
     return Week(number=n, starts=date(2026, 2, 23), ends=date(2026, 3, 1))
 
 
-def row(id, code, section, day, start, end, weeks=ALL, title="Course"):
+def row(id, code, section, day, start, end, weeks=ALL):
     return TimetableRow(
         id=id,
         course_code=code,
-        course_title=title,
         section=section,
         day=day,
         start=t(start),
@@ -464,3 +467,165 @@ def test_clean_data_has_nothing_to_report():
     tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2])]
     staff = [StaffMember("kate", "Ahern, Kate")]
     assert validate(weeks, staff, tt, [], assign(1, "kate", [1, 2])) == []
+
+
+# ------------------------------------------------------------ the catalogue
+
+def course(code, name, year="2026", semester="S1FS", occurrence="WLGI"):
+    return Course(code=code, name=name, academic_year=year,
+                  semester=semester, occurrence=occurrence)
+
+
+def test_a_class_is_named_by_the_catalogue_not_the_timetable():
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    named = expand(tt, [], [], [course("133150", "Live Music Showcases")])
+    assert named[0].course_title == "Live Music Showcases"
+
+
+def test_a_class_whose_course_is_unknown_still_expands_but_has_no_name():
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    only = expand(tt, [], [], [])[0]
+    assert only.course_title == ""
+    assert only.label == "133150 A"
+
+
+def test_a_course_keeps_its_name_across_offerings():
+    both = [course("133150", "Live Music Showcases", semester="S1FS"),
+            course("133150", "Live Music Showcases", semester="S2FS")]
+    assert course_names(both) == {"133150": "Live Music Showcases"}
+
+
+def test_a_course_not_in_the_catalogue_is_reported():
+    weeks = [week(1)]
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    issues = validate(weeks, [], tt, [], [], [course("999999", "Something else")])
+    assert any("133150: not in the course list" in i for i in issues)
+
+
+def test_an_empty_catalogue_does_not_complain_about_every_course():
+    weeks = [week(1)]
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    assert validate(weeks, [], tt, [], [], []) == []
+
+
+def test_a_course_from_the_wrong_semester_is_reported():
+    weeks = [week(1)]
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    issues = validate(weeks, [], tt, [], [],
+                      [course("133150", "Live Music Showcases", semester="S2FS")],
+                      planning=("2026", "S1FS"))
+    assert any("not as an offering in S1FS 2026" in i for i in issues)
+
+
+def test_the_same_offering_twice_is_reported():
+    weeks = [week(1)]
+    twice = [course("133150", "One"), course("133150", "One")]
+    issues = validate(weeks, [], [], [], [], twice)
+    assert any("appears twice" in i for i in issues)
+
+
+def test_a_course_running_in_both_semesters_is_not_a_duplicate():
+    weeks = [week(1)]
+    both = [course("133150", "One", semester="S1FS"),
+            course("133150", "One", semester="S2FS")]
+    assert validate(weeks, [], [], [], [], both) == []
+
+
+# ------------------------------------------------------------ the usual week
+
+def test_a_person_who_teaches_the_same_week_every_week_has_no_departures():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=range(1, 13))]
+    shape = usual_week(expand(tt, [], assign(1, "kate", range(1, 13))), "kate", list(ALL))
+    assert shape.is_settled
+    assert shape.usual_weeks == tuple(range(1, 13))
+    assert [c.label for c in shape.usual] == ["111.701 A"]
+    assert shape.minutes == 180
+
+
+def test_a_cancelled_week_becomes_a_departure():
+    tt = [row(1, "222.702", "WS-A", "Monday", "10:00", "12:00", weeks=range(1, 13))]
+    exc = [ExceptionRow(1, 8, "222.702", "WS-A", Action.CANCEL, note="ANZAC Day")]
+    shape = usual_week(expand(tt, exc, assign(1, "tai", range(1, 13))), "tai", list(ALL))
+    assert not shape.is_settled
+    assert len(shape.departures) == 1
+    away = shape.departures[0]
+    assert away.weeks == (8,)
+    assert [c.label for c in away.cancelled] == ["222.702 WS-A"]
+
+
+def test_an_added_class_becomes_a_departure_that_names_it():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=range(1, 13))]
+    exc = [ExceptionRow(9, 11, "111.701", "A", Action.ADD, day="Thursday",
+                        start=t("13:00"), end=t("16:00"), staff_id="kate")]
+    shape = usual_week(expand(tt, exc, assign(1, "kate", range(1, 13))), "kate", list(ALL))
+    assert shape.usual_weeks == tuple(w for w in range(1, 13) if w != 11)
+    assert len(shape.departures) == 1
+    assert shape.departures[0].weeks == (11,)
+    assert len(shape.departures[0].added) == 1
+    assert shape.departures[0].added[0].status is Status.ADDED
+
+
+def test_a_moved_class_is_reported_as_moved_not_as_two_changes():
+    tt = [row(1, "333.703", "LEC", "Wednesday", "11:00", "13:00", weeks=range(1, 13))]
+    exc = [ExceptionRow(1, 5, "333.703", "LEC", Action.CHANGE,
+                        start=t("14:00"), end=t("16:00"))]
+    shape = usual_week(expand(tt, exc, assign(1, "ruth", range(1, 13))), "ruth", list(ALL))
+    away = shape.departures[0]
+    assert away.weeks == (5,)
+    assert away.added == () and away.gone == ()
+    assert len(away.moved) == 1
+    usually, instead = away.moved[0]
+    assert usually.start == t("11:00") and instead.start == t("14:00")
+
+
+def test_handing_a_class_over_leaves_the_later_weeks_short_of_one():
+    """Chen keeps a studio all semester and gives up a workshop at the break."""
+    tt = [
+        row(1, "111.701", "C", "Tuesday", "14:00", "17:00", weeks=range(1, 13)),
+        row(2, "222.702", "WS-C", "Thursday", "09:00", "12:00", weeks=range(1, 13)),
+    ]
+    assignments = assign(1, "wei", range(1, 13)) + assign(2, "wei", range(1, 7))
+    shape = usual_week(expand(tt, [], assignments), "wei", list(ALL))
+
+    # A six/six split is a tie, and the earlier half wins so the answer is stable.
+    assert shape.usual_weeks == (1, 2, 3, 4, 5, 6)
+    assert len(shape.departures) == 1
+    away = shape.departures[0]
+    assert away.weeks == (7, 8, 9, 10, 11, 12)
+    assert [c.label for c in away.gone] == ["222.702 WS-C"]
+    assert away.added == ()
+
+
+def test_a_week_where_somebody_teaches_nothing_is_a_week_like_any_other():
+    tt = [row(1, "222.702", "LEC", "Monday", "09:00", "10:00", weeks=[7, 8, 9])]
+    shape = usual_week(expand(tt, [], assign(1, "ruth", [7, 8, 9])), "ruth", list(ALL))
+    assert shape.usual == ()                        # nine weeks of nothing wins
+    assert shape.usual_weeks == (1, 2, 3, 4, 5, 6, 10, 11, 12)
+    assert shape.departures[0].weeks == (7, 8, 9)
+    assert [c.label for c in shape.departures[0].added] == ["222.702 LEC"]
+
+
+def test_somebody_with_no_classes_at_all_has_an_empty_settled_shape():
+    shape = usual_week([], "nobody", list(ALL))
+    assert shape.usual == ()
+    assert shape.is_settled
+    assert shape.usual_weeks == tuple(ALL)
+
+
+def test_the_usual_week_is_read_in_day_and_time_order():
+    tt = [
+        row(1, "333.703", "TUT", "Friday", "09:00", "10:30", weeks=[1]),
+        row(2, "222.702", "WS-A", "Monday", "10:00", "12:00", weeks=[1]),
+        row(3, "444.704", "SEM", "Monday", "09:00", "10:00", weeks=[1]),
+    ]
+    assignments = (assign(1, "tai", [1]) + assign(2, "tai", [1]) + assign(3, "tai", [1]))
+    shape = usual_week(expand(tt, [], assignments), "tai", [1])
+    assert [c.label for c in shape.usual] == ["444.704 SEM", "222.702 WS-A", "333.703 TUT"]
+
+
+def test_shapes_covers_everybody_including_people_with_nothing():
+    tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    staff = [StaffMember("kate", "Ahern, Kate"), StaffMember("idle", "Nobody, No")]
+    got = shapes(expand(tt, [], assign(1, "kate", [1])), staff, [1])
+    assert [s.staff_id for s in got] == ["kate", "idle"]
+    assert got[1].usual == ()

@@ -5,6 +5,9 @@ staffed, a semester split between two people, a section nobody covers, a
 cancelled week, an added class, and a slot where the obvious candidate is
 already busy so the picker has somebody to grey out.
 
+The catalogue is deliberately bigger than the timetable, because a real export
+covers a whole school and a manager staffs a slice of it.
+
 Clear it from Setup once your own timetable is in.
 """
 
@@ -41,21 +44,37 @@ ALL = list(range(1, 13))
 FIRST_HALF = list(range(1, 7))
 SECOND_HALF = list(range(7, 13))
 
-# The external timetable. No staffing here: that is the manager's job.
+YEAR = "2026"
+SEMESTER = "S1FS"
+
+# The catalogue, as it would arrive from the student management system. The
+# coordinators here are accountabilities, not teaching: nothing reads them as
+# staffing. The last two are not timetabled at all, which is normal.
+COURSES = [
+    ("111.701", "Design Studio", SEMESTER, "Ktori, Andre", "Carter, Dave"),
+    ("222.702", "Materials", SEMESTER, "Carter, Dave", "Carter, Dave"),
+    ("333.703", "History and Theory", SEMESTER, "He, Jon", "He, Jon"),
+    ("444.704", "Professional Practice", SEMESTER, "Gilmour, Grayson", "Carter, Dave"),
+    ("555.705", "Digital Fabrication", SEMESTER, "Cameron, Dana", "Cameron, Dana"),
+    ("666.706", "Sound Studies", "S2FS", "He, Jon", "He, Jon"),
+]
+
+# The external timetable. It names no course and no staff: the first comes from
+# the catalogue, the second is the manager's job.
 TIMETABLE = [
-    ("111.701", "Design Studio", "A", "Tuesday", "14:00", "17:00", ALL),
-    ("111.701", "Design Studio", "B", "Tuesday", "14:00", "17:00", ALL),
-    ("111.701", "Design Studio", "C", "Tuesday", "14:00", "17:00", ALL),
-    ("111.701", "Design Studio", "D", "Tuesday", "14:00", "17:00", ALL),
-    ("222.702", "Materials", "LEC", "Monday", "09:00", "10:00", [7, 8, 9]),
-    ("222.702", "Materials", "WS-A", "Monday", "10:00", "12:00", ALL),
-    ("222.702", "Materials", "WS-B", "Monday", "10:00", "12:00", ALL),
-    ("222.702", "Materials", "WS-C", "Thursday", "09:00", "12:00", ALL),
-    ("222.702", "Materials", "WS-D", "Thursday", "09:00", "12:00", ALL),
-    ("333.703", "History and Theory", "LEC", "Wednesday", "11:00", "13:00", ALL),
-    ("333.703", "History and Theory", "TUT-A", "Friday", "09:00", "10:30", ALL),
-    ("333.703", "History and Theory", "TUT-B", "Friday", "11:00", "12:30", ALL),
-    ("444.704", "Professional Practice", "SEM", "Wednesday", "14:00", "16:00", ALL),
+    ("111.701", "A", "Tuesday", "14:00", "17:00", ALL),
+    ("111.701", "B", "Tuesday", "14:00", "17:00", ALL),
+    ("111.701", "C", "Tuesday", "14:00", "17:00", ALL),
+    ("111.701", "D", "Tuesday", "14:00", "17:00", ALL),
+    ("222.702", "LEC", "Monday", "09:00", "10:00", [7, 8, 9]),
+    ("222.702", "WS-A", "Monday", "10:00", "12:00", ALL),
+    ("222.702", "WS-B", "Monday", "10:00", "12:00", ALL),
+    ("222.702", "WS-C", "Thursday", "09:00", "12:00", ALL),
+    ("222.702", "WS-D", "Thursday", "09:00", "12:00", ALL),
+    ("333.703", "LEC", "Wednesday", "11:00", "13:00", ALL),
+    ("333.703", "TUT-A", "Friday", "09:00", "10:30", ALL),
+    ("333.703", "TUT-B", "Friday", "11:00", "12:30", ALL),
+    ("444.704", "SEM", "Wednesday", "14:00", "16:00", ALL),
 ]
 
 # Who covers what, by (course, section) and weeks.
@@ -119,6 +138,15 @@ EXCEPTIONS = [
 ]
 
 
+def _email(name: str) -> str:
+    """Surname, First becomes F.Surname@example.ac.nz."""
+    if not name:
+        return ""
+    surname, _, first = name.partition(",")
+    initial = first.strip()[:1]
+    return f"{initial}.{surname.strip()}@example.ac.nz".lower()
+
+
 def load(conn) -> None:
     store.replace_weeks(
         conn,
@@ -134,13 +162,34 @@ def load(conn) -> None:
             {"id": staff_id, "name": name, "email": email, "target_minutes": target},
         )
 
+    store.save_courses(conn, [
+        {
+            "code": code,
+            "name": name,
+            "academic_year": YEAR,
+            "semester": semester,
+            "occurrence": "WLGI",
+            "college": "CCA College of Creative Arts",
+            "programme": "UBDES-Bachelor of Design",
+            "coordinator": coordinator,
+            "coordinator_email": _email(coordinator),
+            "offering_coordinator": offering,
+            "offering_coordinator_email": _email(offering),
+            "grade_reviewer": "",
+            "grade_reviewer_email": "",
+            "department": "SD00123 - School of Design",
+        }
+        for code, name, semester, coordinator, offering in COURSES
+    ])
+
+    store.set_settings(conn, {"academic_year": YEAR, "semester": SEMESTER})
+
     ids: dict[tuple[str, str], int] = {}
-    for code, title, section, day, start, end, weeks in TIMETABLE:
+    for code, section, day, start, end, weeks in TIMETABLE:
         ids[(code, section)] = store.save_timetable_row(
             conn,
             {
                 "course_code": code,
-                "course_title": title,
                 "section": section,
                 "day": day,
                 "start": start,
@@ -160,6 +209,8 @@ def clear(conn) -> None:
     with conn:
         for table in (
             "assignments",
+            "courses",
+            "settings",
             "exceptions",
             "timetable_weeks",
             "timetable",
