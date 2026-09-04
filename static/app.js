@@ -3,7 +3,7 @@
 // Kept in step with VERSION in app.py. The browser reads this file fresh on
 // every load but the routes live in the running server, so a new front end can
 // meet an old one. This is what lets the page say so.
-const APP_VERSION = "2026-09-05.3";
+const APP_VERSION = "2026-09-05.4";
 
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
               "Saturday", "Sunday"];
@@ -306,6 +306,10 @@ function tile(value, label, tone = "") {
     el("div", { class: "label", text: label }));
 }
 
+const NEEDS_PAGE = 25;
+
+let needsQuery = "";
+
 function needsSomebodyPanel() {
   const rows = state.coverage.rows;
   const panel = el("section", { class: "panel" },
@@ -320,33 +324,62 @@ function needsSomebodyPanel() {
   }
 
   panel.append(el("p", { class: "hint" },
-    "Classes with nobody on them. That can be deliberate, if another team ",
-    "teaches them. Click one to staff it."));
+    "Classes with nobody on them, the emptiest first. That can be deliberate, ",
+    "if another team teaches them. Click one to staff it."));
 
-  const table = el("table", {},
-    el("thead", {}, el("tr", {},
-      el("th", { text: "Class" }), el("th", { text: "Day" }),
-      el("th", { text: "Weeks" }), el("th", {}))));
+  panel.append(el("div", { class: "toolbar" },
+    el("input", {
+      type: "search", class: "search", value: needsQuery,
+      placeholder: "Find a course, section or day",
+      oninput: (e) => { needsQuery = e.target.value; draw(); },
+    })));
 
-  const body = el("tbody");
-  for (const row of rows) {
-    body.append(el("tr", {},
-      el("td", {}, el("strong", { text: `${row.course_code} ${row.section}` }),
-        row.course_title ? el("div", { class: "muted", text: row.course_title }) : null),
-      el("td", {}, dayDot(row.day), row.day || "—"),
-      el("td", { text: weekRanges(row.weeks) },),
-      el("td", { class: "right" },
-        row.timetable_row_id
-          ? el("button", {
-              class: "action",
-              onclick: () => { go("planner"); openAssign(row.timetable_row_id); },
-              text: "Staff it",
-            })
-          : el("span", { class: "muted", text: "added class" }))));
-  }
-  table.append(body);
-  panel.append(table);
+  const holder = el("div");
+  panel.append(holder);
+  draw();
   return panel;
+
+  // Only the table is redrawn as you type, so the caret stays where it is.
+  function draw() {
+    const needle = needsQuery.trim().toLowerCase();
+    const matches = rows.filter((row) => !needle || [
+      row.course_code, row.section, row.day, row.course_title,
+    ].some((value) => (value || "").toLowerCase().includes(needle)));
+
+    const table = el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "Class" }), el("th", { text: "Day" }),
+        el("th", { text: "Weeks" }), el("th", {}))));
+
+    const body = el("tbody");
+    for (const row of matches.slice(0, NEEDS_PAGE)) {
+      body.append(el("tr", {},
+        el("td", {}, el("strong", { text: `${row.course_code} ${row.section}` }),
+          row.course_title ? el("div", { class: "muted", text: row.course_title }) : null),
+        el("td", {}, dayDot(row.day), row.day || "—"),
+        el("td", { text: weekRanges(row.weeks) },),
+        el("td", { class: "right" },
+          row.timetable_row_id
+            ? el("button", {
+                class: "action",
+                onclick: () => { go("planner"); openAssign(row.timetable_row_id); },
+                text: "Staff it",
+              })
+            : el("span", { class: "muted", text: "added class" }))));
+    }
+    table.append(body);
+
+    holder.replaceChildren(
+      matches.length
+        ? table
+        : el("p", { class: "empty", text: "Nothing matches that." }),
+      matches.length > NEEDS_PAGE
+        ? el("p", { class: "muted", text:
+            `Showing ${NEEDS_PAGE} of ${matches.length}. Narrow the search to `
+            + `see the rest.` })
+        : el("p", { class: "muted", text:
+            `${matches.length} of ${rows.length} unstaffed.` }));
+  }
 }
 
 function utilisationPanel() {
@@ -1125,6 +1158,17 @@ function staffView() {
 
   const bar = el("div", { class: "toolbar" }, switcher);
   if (staffMode === "week") bar.append(teamWeekPicker());
+  bar.append(el("span", { class: "spacer" }));
+  bar.append(el("button", {
+    class: "action", text: "Export",
+    title: "Everyone's teaching as a spreadsheet, a calendar each",
+    onclick: () => download("/api/staff/calendars.xlsx"),
+  }));
+  bar.append(el("button", {
+    class: "action", text: "Print",
+    title: "This view, one person to a page",
+    onclick: () => window.print(),
+  }));
   wrap.append(bar);
 
   if (staffMode === "week") wrap.append(teamMode());
@@ -1193,41 +1237,27 @@ function teamMode() {
     "Everyone at once, laid out as the week is. Free time is the empty space, ",
     "which is what you are looking for when you have a class to give away."));
 
-  const classes = state.classes.filter((c) => c.week === teamWeek);
-  panel.append(weekGrid(classes, { colourBy: "person", showWho: true }));
-  panel.append(teamGaps(classes));
+  // Unstaffed classes are deliberately not drawn here. This view answers "who
+  // is free", and a term nobody has staffed yet fills it with dashed blocks
+  // and a wall of gap tiles that bury the very space you are looking for.
+  // The Dashboard's Needs somebody list is where that question is answered,
+  // filtered and capped.
+  const week = state.classes.filter((c) => c.week === teamWeek);
+  panel.append(weekGrid(week.filter((c) => c.staff_id), {
+    colourBy: "person", showWho: true,
+  }));
+
+  const short = week.filter((c) => c.runs && !c.staff_id).length;
+  panel.append(el("p", { class: "hint", style: "margin-top:0.8rem" },
+    short
+      ? `${short} ${short === 1 ? "class" : "classes"} this week ${short === 1
+          ? "has" : "have"} nobody on them, and are not drawn. `
+      : "Everything that runs this week has somebody on it. ",
+    short
+      ? el("button", { class: "link", text: "See what needs somebody",
+                       onclick: () => go("dashboard") })
+      : null));
   return panel;
-}
-
-/** Is this person clear at that time in that week? */
-function isFreeAt(staffId, week, day, start, end) {
-  return !state.classes.some((c) =>
-    c.staff_id === staffId && c.week === week && c.day === day
-    && c.runs && c.start && c.end
-    && toMinutes(c.start) < toMinutes(end) && toMinutes(start) < toMinutes(c.end));
-}
-
-function teamGaps(classes) {
-  const uncovered = classes.filter((c) => c.runs && !c.staff_id);
-  const box = el("div", { class: "gaps" });
-
-  if (!uncovered.length) {
-    box.append(el("span", { class: "muted",
-      text: "Everything that runs this week has somebody on it." }));
-    return box;
-  }
-
-  for (const c of uncovered) {
-    const free = state.staff
-      .filter((p) => isFreeAt(p.id, c.week, c.day, c.start, c.end))
-      .map((p) => p.name);
-    box.append(el("div", {},
-      el("div", { class: "caption", text: `Nobody on ${c.label}` }),
-      el("div", {}, `${c.day} ${c.start}–${c.end} · `,
-        el("span", { class: free.length ? "" : "muted" },
-          free.length ? `free then: ${free.join(", ")}` : "nobody is free then"))));
-  }
-  return box;
 }
 
 // ----------------------------------------------------------- the semester
@@ -1425,24 +1455,20 @@ function blocksFor(classes, from, { colourBy = "day", showWho = false } = {}) {
     const each = span / group.length;
 
     group.forEach((c, index) => {
-      const nobody = colourBy === "person" && !c.staff_id;
-      const ink = nobody ? "var(--gap)"
-        : colourBy === "person" ? personColour(c.staff_id) : dayColour(c.day);
+      const ink = colourBy === "person" ? personColour(c.staff_id) : dayColour(c.day);
       const box = `top:${(start - from) * perMinute + index * each}px;`
                 + ` height:${each - 2}px; border-left-color:${ink};`;
 
       out.push(el("div", {
-        class: `blk ${c.clashing ? "clash" : ""} ${c.runs ? "" : "off"} ${nobody ? "nobody" : ""}`,
-        style: nobody
-          ? `${box} background:var(--warn-wash)`
-          : `${box} background:color-mix(in srgb, ${ink} 11%, var(--surface))`,
+        class: `blk ${c.clashing ? "clash" : ""} ${c.runs ? "" : "off"}`,
+        style: `${box} background:color-mix(in srgb, ${ink} 11%, var(--surface))`,
         title: `${c.label}${c.course_title ? " " + c.course_title : ""}, `
              + `${c.day} ${c.start}-${c.end}`
-             + (showWho ? `, ${c.staff_id ? staffName(c.staff_id) : "nobody"}` : ""),
+             + (showWho ? `, ${staffName(c.staff_id)}` : ""),
       },
         showWho
           ? el("span", { class: "blk-label" },
-              c.staff_id ? staffName(c.staff_id).split(",")[0] : "nobody",
+              staffName(c.staff_id),
               el("span", { class: "blk-what", text: ` ${c.label}` }))
           : el("span", { class: "blk-label", text: c.label }),
         // Four studios stacked in one slot leave about 25px each, which is one
@@ -1638,6 +1664,99 @@ let coursePreview = null;
 
 const COURSE_PAGE = 60;
 
+// ----------------------------------------------------- catalogue vs timetable
+
+/** Where the timetable and the catalogue disagree.
+
+    The timetable side is actionable and the catalogue side is not, on purpose.
+    A code that is not in the catalogue may be a course nobody imported, or it
+    may be a space or a letter in the wrong place: matching is exact, so a typo
+    looks identical to a missing course. Wiring a delete button straight to a
+    typo detector is the wrong shape, so this hands the rows to the Planner
+    with them ticked, where deleting is one click and comes back with an undo.
+
+    Nothing here ever removes a course from the catalogue. The catalogue is the
+    whole institution and this tool staffs a corner of it, so a course with no
+    classes is the normal case, not a fault.
+ */
+function reconcilePanel() {
+  const found = state.reconciliation;
+  if (!found) return null;
+
+  const wrong = [...found.unknown, ...found.not_offered];
+  if (!wrong.length && !found.untimetabled.length) return null;
+
+  const panel = el("section", { class: "panel" },
+    el("h2", { text: "The timetable and the catalogue" }));
+
+  if (wrong.length) {
+    const rows = wrong.reduce((n, f) => n + f.row_ids.length, 0);
+    panel.append(el("p", { class: "hint" },
+      "Timetabled here, but not in the catalogue for this semester, so these ",
+      "classes have no name. Check the codes before removing anything: a ",
+      "course code is matched exactly, so a stray space reads as a course ",
+      "nobody has heard of."));
+
+    const table = el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "Code" }), el("th", { text: "Sections" }),
+        el("th", { text: "Why" }), el("th", {}))));
+    const body = el("tbody");
+
+    for (const f of found.unknown) body.append(reconcileRow(f, "not in the catalogue"));
+    for (const f of found.not_offered) {
+      body.append(reconcileRow(f, `not offered in ${termLabel(state.settings || {})}`));
+    }
+    table.append(body);
+    panel.append(table);
+
+    panel.append(el("div", { class: "toolbar" },
+      el("button", {
+        class: "action",
+        text: `Select all ${rows} in the Planner`,
+        onclick: () => selectInPlanner(wrong.flatMap((f) => f.row_ids)),
+      })));
+  }
+
+  if (found.untimetabled.length) {
+    panel.append(el("div", { class: "caption", style: "padding-top: 0.9rem",
+                             text: "In the catalogue, nothing on the timetable" }));
+    panel.append(el("p", { class: "hint" },
+      "Offered this semester with no classes here. Usually right: somebody ",
+      "else teaches them. Listed so you can see what you have not planned."));
+    panel.append(el("div", { class: "chips" },
+      found.untimetabled.map((c) => el("span", { class: "chip",
+        title: c.name, text: c.code }))));
+  }
+  return panel;
+}
+
+function reconcileRow(found, why) {
+  // A code with a space on the end looks exactly like the real one, which is
+  // how it got typed in the first place. Show the space.
+  const padded = found.code !== found.code.trim();
+  return el("tr", {},
+    el("td", {},
+      el("strong", { text: padded ? `"${found.code}"` : found.code }),
+      padded ? el("div", { class: "muted", text: "has a space in it" }) : null),
+    el("td", { class: "muted", text: found.sections.join(", ") }),
+    el("td", { class: "muted", text: why }),
+    el("td", { class: "right" },
+      el("button", {
+        class: "action", text: "Select in the Planner",
+        onclick: () => selectInPlanner(found.row_ids),
+      })));
+}
+
+/** Hand a set of rows to the Planner, ticked, and let its bulk bar do the rest. */
+function selectInPlanner(rowIds) {
+  go("planner");
+  selected.clear();
+  for (const id of rowIds) selected.add(id);
+  render();
+  toast(`${rowIds.length} ${rowIds.length === 1 ? "class" : "classes"} selected.`);
+}
+
 function coursesView() {
   const wrap = el("div", {}, staleServerBanner(), issuesPanel());
 
@@ -1688,6 +1807,10 @@ function coursesView() {
   const holder = el("div", { id: "coursetable" });
   panel.append(holder);
   wrap.append(panel);
+
+  // append() stringifies null; el() is the thing that skips it.
+  const mismatch = reconcilePanel();
+  if (mismatch) wrap.append(mismatch);
 
   // Rendered separately so typing in the search box does not rebuild the page
   // and lose the caret.
@@ -1892,48 +2015,170 @@ async function commitCourses(mode) {
   }
 }
 
+// ------------------------------------------------------------ setup: staff
+
+let staffFocus = null;   // {id, field} of the cell to put the caret back in
+
+/** Staff as an editable table, with a blank row waiting at the bottom.
+
+    A modal per person is fine for one correction and wrong for six hires: it
+    is four clicks of chrome around one field of typing. Editing in the cell,
+    the way the teaching calendar below already works, makes adding a team a
+    matter of typing down the column.
+
+    Every input saves on change, which fires on blur or Enter rather than per
+    keystroke, so a full refresh between edits is not a caret hazard.
+ */
+function staffPanel() {
+  const panel = el("section", { class: "panel" }, el("h2", { text: "Staff" }));
+
+  panel.append(el("p", { class: "hint" },
+    "The people you are responsible for. Type in a cell to change it, and in ",
+    "the last row to add somebody. A target is contact hours a week, and is ",
+    "optional."));
+
+  const table = el("table", {},
+    el("thead", {}, el("tr", {},
+      el("th", { text: "Name" }), el("th", { text: "Email" }),
+      el("th", { text: "Target h/week" }), el("th", { text: "Id" }),
+      el("th", {}))));
+
+  const body = el("tbody");
+  for (const person of state.staff) body.append(staffRow(person));
+  body.append(staffRow(null));
+  table.append(body);
+  panel.append(table);
+
+  // Saving re-renders the page, which throws the caret away. Put it back in
+  // the cell it came from, so typing a name into the blank row leaves you in
+  // the blank row ready for the next person, and correcting an email leaves
+  // you in that email. One rule, no surprises.
+  if (staffFocus) {
+    const { id, field } = staffFocus;
+    staffFocus = null;
+    setTimeout(() => {
+      const row = table.querySelector(
+        id ? `tr[data-staff="${CSS.escape(id)}"]` : "tbody tr:last-child");
+      row?.querySelector(`[data-field="${field}"]`)?.focus();
+    }, 0);
+  }
+
+  // Names used to be asked for surname first. Offer to turn the ones that
+  // still are, rather than rewriting somebody's records behind their back.
+  const backwards = state.staff.filter((p) => p.name.includes(","));
+  if (backwards.length) {
+    panel.append(el("div", { class: "toolbar" },
+      el("button", {
+        class: "link",
+        text: `Swap ${backwards.length} ${backwards.length === 1 ? "name" : "names"}`
+            + " to first name first",
+        onclick: () => swapNames(backwards),
+      })));
+  }
+  return panel;
+}
+
+function staffRow(person) {
+  const cell = (value, opts, save) => el("td", {}, el("input", {
+    type: opts.type || "text", value: value ?? "",
+    "data-field": opts.field,
+    placeholder: opts.placeholder || "",
+    "aria-label": `${opts.label}${person ? ` for ${person.name}` : " for somebody new"}`,
+    style: opts.style || "",
+    onchange: (e) => save(e.target.value.trim(), e.target),
+  }));
+
+  const write = (field) => (value, input) => saveStaff(person, field, value, input);
+
+  return el("tr", person ? { "data-staff": person.id } : {},
+    el("td", {},
+      person
+        ? el("span", { class: "swatch", style: `background:${personColour(person.id)}` })
+        : null,
+      el("input", {
+        type: "text", value: person?.name ?? "", "data-field": "name",
+        placeholder: person ? "" : "Add somebody",
+        "aria-label": person ? `Name of ${person.name}` : "Name of somebody new",
+        style: person ? "width:calc(100% - 1.1rem)" : "",
+        onchange: (e) => saveStaff(person, "name", e.target.value.trim(), e.target),
+      })),
+    cell(person?.email, { label: "Email", type: "email", field: "email" },
+         write("email")),
+    cell(person?.target_minutes ? person.target_minutes / 60 : "",
+         { label: "Target hours", type: "number", placeholder: "optional",
+           field: "target_minutes" },
+         write("target_minutes")),
+    el("td", { class: "muted nowrap", text: person ? person.id : "" }),
+    el("td", { class: "right nowrap" },
+      person
+        ? iconButton("remove", `Remove ${person.name}`,
+                     () => removeStaff(person), "danger")
+        : null));
+}
+
+/** One cell's worth of change, sent as the whole person.
+
+    A new person is only worth creating once there is a name to call them, so
+    typing an email into the blank row does nothing until the name is there.
+    The id follows from the name on the server; nobody should have to invent a
+    key to add a colleague.
+ */
+async function saveStaff(person, changedField, value, input) {
+  const isTarget = changedField === "target_minutes";
+  const body = person
+    ? { id: person.id, name: person.name, email: person.email,
+        target_minutes: person.target_minutes }
+    : { name: "", email: "", target_minutes: null };
+
+  body[changedField] = isTarget
+    ? (value ? Math.round(Number(value) * 60) : null)
+    : value;
+
+  if (!body.name) {
+    if (person) {
+      toast("A person needs a name.", true);
+      input.value = person.name;
+    }
+    return;
+  }
+
+  try {
+    if (person) {
+      await api("PUT", `/api/staff/${person.id}`, body);
+      staffFocus = { id: person.id, field: changedField };
+    } else {
+      await api("POST", "/api/staff", body);
+      staffFocus = { id: "", field: "name" };
+    }
+    await refresh();
+    if (!person) toast(`${body.name} added.`);
+  } catch (error) {
+    toast(error.message, true);
+    await refresh();
+  }
+}
+
+/** Turn "Ahern, Kate" into "Kate Ahern", for the people still written that way. */
+async function swapNames(people) {
+  try {
+    for (const person of people) {
+      const [surname, ...rest] = person.name.split(",");
+      const swapped = `${rest.join(",").trim()} ${surname.trim()}`.trim();
+      await api("PUT", `/api/staff/${person.id}`, { ...person, name: swapped });
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+  await refresh();
+  toast(`${people.length} ${people.length === 1 ? "name" : "names"} swapped.`);
+}
+
 // ------------------------------------------------------------ setup
 
 function setupView() {
   const wrap = el("div", {}, staleServerBanner(), issuesPanel());
 
-  // staff
-  const staffPanel = el("section", { class: "panel" },
-    el("div", { class: "toolbar" },
-      el("h2", { text: "Staff" }),
-      el("span", { class: "spacer" }),
-      el("button", { class: "action", text: "Add somebody", onclick: () => editStaff(null) })));
-
-  staffPanel.append(el("p", { class: "hint" },
-    "The people you are responsible for. A target is contact hours a week, and ",
-    "is optional."));
-
-  if (state.staff.length) {
-    const table = el("table", {},
-      el("thead", {}, el("tr", {},
-        el("th", { text: "Name" }), el("th", { text: "Id" }),
-        el("th", { text: "Email" }), el("th", { class: "num", text: "Target" }),
-        el("th", {}))));
-    const body = el("tbody");
-    for (const person of state.staff) {
-      body.append(el("tr", {},
-        el("td", {},
-          el("span", { class: "swatch", style: `background:${personColour(person.id)}` }),
-          person.name),
-        el("td", { class: "muted", text: person.id }),
-        el("td", { class: "muted", text: person.email || "" }),
-        el("td", { class: "num muted", text: person.target_minutes ? `${hours(person.target_minutes)} h` : "—" }),
-        el("td", { class: "right nowrap" },
-          iconButton("edit", `Edit ${person.name}`, () => editStaff(person)),
-          iconButton("remove", `Remove ${person.name}`,
-            () => removeStaff(person), "danger"))));
-    }
-    table.append(body);
-    staffPanel.append(table);
-  } else {
-    staffPanel.append(el("p", { class: "empty", text: "Nobody yet." }));
-  }
-  wrap.append(staffPanel);
+  wrap.append(staffPanel());
 
   wrap.append(offeringPanel());
 
@@ -2618,33 +2863,6 @@ function editException(exc) {
   setTimeout(showStaff, 0);
 }
 
-function editStaff(person) {
-  const fields = [
-    field("Name", textInput("st-name", person?.name, { placeholder: "Surname, First" })),
-    field("Id", textInput("st-id", person?.id, { placeholder: "surname" })),
-    field("Email", textInput("st-email", person?.email, { type: "email" })),
-    field("Target hours a week", textInput("st-target",
-      person?.target_minutes ? person.target_minutes / 60 : "",
-      { type: "number", placeholder: "optional" })),
-    el("p", { class: "hint" },
-      "The id is what the records use. Changing it carries their staffing with it."),
-  ];
-
-  openEditor(person ? person.name : "Somebody new", fields,
-    () => {
-      const targetHours = val("st-target");
-      const body = {
-        id: val("st-id"), name: val("st-name"), email: val("st-email"),
-        target_minutes: targetHours ? Math.round(Number(targetHours) * 60) : null,
-      };
-      if (!body.id || !body.name) throw new Error("A name and an id are needed.");
-      return person
-        ? api("PUT", `/api/staff/${person.id}`, body)
-        : api("POST", "/api/staff", body);
-    },
-  );
-}
-
 // ------------------------------------------------------------ routing
 
 const VIEWS = {
@@ -2672,6 +2890,7 @@ function go(view) {
     wizard = null;
     selected.clear();
     plannerQuery = "";
+    needsQuery = "";
     gapsOnly = false;
   }
   location.hash = view;

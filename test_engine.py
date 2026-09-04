@@ -34,6 +34,7 @@ from engine import (
     load_by_staff,
     over_target,
     overlaps,
+    reconcile,
     shapes,
     uncovered_rows,
     usual_week,
@@ -343,8 +344,8 @@ def test_over_target_names_the_weeks_somebody_is_past_their_target():
     tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2])]
     classes = expand(tt, [], assign(1, "kate", [1, 2]))
     staff = [
-        StaffMember("kate", "Ahern, Kate", target_minutes=120),
-        StaffMember("sam", "Brill, Sam", target_minutes=None),
+        StaffMember("kate", "Kate Ahern", target_minutes=120),
+        StaffMember("sam", "Sam Brill", target_minutes=None),
     ]
     assert over_target(staff, classes) == [("kate", 1, 180, 120), ("kate", 2, 180, 120)]
 
@@ -352,7 +353,7 @@ def test_over_target_names_the_weeks_somebody_is_past_their_target():
 def test_somebody_without_a_target_cannot_be_over_it():
     tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
     classes = expand(tt, [], assign(1, "tai", [1]))
-    assert over_target([StaffMember("tai", "Edmond, Tai")], classes) == []
+    assert over_target([StaffMember("tai", "Tai Edmond")], classes) == []
 
 
 def test_a_persons_semester_includes_their_cancelled_weeks():
@@ -466,7 +467,7 @@ def test_backwards_times_and_unknown_days_are_reported():
 def test_clean_data_has_nothing_to_report():
     weeks = [week(n) for n in (1, 2)]
     tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1, 2])]
-    staff = [StaffMember("kate", "Ahern, Kate")]
+    staff = [StaffMember("kate", "Kate Ahern")]
     assert validate(weeks, staff, tt, [], assign(1, "kate", [1, 2])) == []
 
 
@@ -626,7 +627,7 @@ def test_the_usual_week_is_read_in_day_and_time_order():
 
 def test_shapes_covers_everybody_including_people_with_nothing():
     tt = [row(1, "111.701", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
-    staff = [StaffMember("kate", "Ahern, Kate"), StaffMember("idle", "Nobody, No")]
+    staff = [StaffMember("kate", "Kate Ahern"), StaffMember("idle", "No Nobody")]
     got = shapes(expand(tt, [], assign(1, "kate", [1])), staff, [1])
     assert [s.staff_id for s in got] == ["kate", "idle"]
     assert got[1].usual == ()
@@ -695,3 +696,63 @@ def test_a_semester_of_no_weeks_is_no_weeks():
 def test_a_backwards_break_is_ignored_rather_than_looping():
     built = build_weeks(date(2027, 7, 26), 2, [(date(2027, 9, 10), date(2027, 9, 1))])
     assert len(built) == 2
+
+
+# ------------------------------------------------------------ reconciling
+
+def test_reconcile_names_the_rows_behind_an_unknown_course():
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1]),
+          row(2, "133150", "B", "Wednesday", "14:00", "17:00", weeks=[1])]
+    found = reconcile(tt, [course("999999", "Something else")])
+
+    # The prose version could only name the code. This can be acted on.
+    assert found["unknown"] == [
+        {"code": "133150", "row_ids": [1, 2], "sections": ["A", "B"]}]
+    assert found["not_offered"] == []
+
+
+def test_reconcile_separates_the_wrong_semester_from_the_unknown():
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    found = reconcile(tt, [course("133150", "Live Music Showcases", semester="S2FS")],
+                      planning=("2026", "S1FS"))
+
+    # It is a real course. It is simply not running in what you are planning,
+    # which is a different problem with a different fix.
+    assert found["unknown"] == []
+    assert [f["code"] for f in found["not_offered"]] == ["133150"]
+
+
+def test_reconcile_reports_a_catalogue_course_nobody_timetabled():
+    offered = course("133167", "Sound Design")
+    found = reconcile([], [offered], planning=("2026", "S1FS"))
+    assert [c["code"] for c in found["untimetabled"]] == ["133167"]
+
+
+def test_reconcile_says_nothing_when_the_catalogue_is_empty():
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    # No catalogue is a tool nobody has imported courses into, not a timetable
+    # where every code is wrong.
+    assert reconcile(tt, []) == {"unknown": [], "not_offered": [], "untimetabled": []}
+
+
+def test_reconcile_needs_a_term_before_it_can_judge_an_offering():
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1])]
+    found = reconcile(tt, [course("133150", "Live Music Showcases", semester="S2FS")])
+    assert found["not_offered"] == []
+    assert found["untimetabled"] == []
+
+
+def test_the_problems_panel_and_the_reconciler_agree():
+    """One rule, two presentations. validate() is prose over reconcile()."""
+    weeks = [week(1)]
+    tt = [row(1, "133150", "A", "Tuesday", "14:00", "17:00", weeks=[1]),
+          row(2, "133154", "LEC", "Monday", "09:00", "10:00", weeks=[1])]
+    catalogue = [course("133154", "Music, People, Places")]
+
+    issues = validate(weeks, [], tt, [], [], catalogue, planning=("2026", "S1FS"))
+    found = reconcile(tt, catalogue, planning=("2026", "S1FS"))
+
+    assert [f["code"] for f in found["unknown"]] == ["133150"]
+    assert any("133150: not in the course list" in i for i in issues)
+    # A course that is offered and timetabled is nobody's problem.
+    assert found["not_offered"] == [] and found["untimetabled"] == []

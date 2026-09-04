@@ -310,7 +310,8 @@ td { padding: 0.45rem 0.5rem; border-bottom: 1px solid var(--rule-soft); vertica
 
 tbody tr:last-child td { border-bottom: none; }
 
-table input[type="text"], table input[type="date"] {
+table input[type="text"], table input[type="date"],
+table input[type="email"], table input[type="number"] {
   border: 1px solid transparent;
   background: none;
   font: inherit;
@@ -530,7 +531,10 @@ table input:focus { border-color: var(--focus); background: var(--surface); }
   border-radius: 3px; border-left: 3px solid var(--quiet);
   padding: 1px 5px; overflow: hidden; line-height: 1.25;
 }
-.blk-label { display: block; font-size: 0.75rem; font-weight: 620; }
+.blk-label {
+  display: block; font-size: 0.75rem; font-weight: 620;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .blk-when  { display: block; font-size: 0.7rem; color: var(--ink-soft); }
 .blk-title {
   display: block; font-size: 0.7rem; color: var(--quiet);
@@ -585,18 +589,7 @@ table input:focus { border-color: var(--focus); background: var(--surface); }
 
 .blk.off { opacity: 0.55; }
 .blk.off .blk-label { text-decoration: line-through; }
-.blk.nobody { border-style: dashed; border-width: 1px 1px 1px 3px; color: var(--warn); }
 .blk-what { font-weight: 400; color: var(--ink-soft); }
-
-.gaps {
-  display: flex;
-  gap: 1.6rem;
-  flex-wrap: wrap;
-  border-top: 1px solid var(--rule-soft);
-  margin-top: 0.6rem;
-  padding-top: 0.7rem;
-  font-size: 0.85rem;
-}
 
 .timeline {
   display: grid;
@@ -777,3 +770,53 @@ select { font: inherit; }
 .toast-undo:hover { background: rgba(255, 255, 255, 0.16); }
 
 .cand-why .over { color: var(--clash); font-weight: 620; }
+
+/* ------------------------------------------------------------ printing
+
+   The staff page on paper, for a meeting or a noticeboard. Colour is the
+   legend here rather than decoration -- a day, a person -- so it has to
+   survive the print, and one person to a page is the only pagination that
+   makes a semester readable.
+*/
+
+@media print {
+  @page { margin: 14mm; }
+
+  body { background: #fff; }
+
+  /* Hide the controls, not the bars they sit in: a person's name lives in a
+     toolbar beside their hours, and hiding the container takes the heading
+     with it. */
+  header nav, .termpick, .verdict, #toasts, dialog,
+  .action, .iconbtn, .link, .seg, .search, .pill, .bulkbar, .issues,
+  td.tick, th.tick {
+    display: none !important;
+  }
+
+  header { border-bottom: 1px solid #ccc; padding: 0 0 0.5rem; }
+  main { padding: 0.8rem 0 0; max-width: none; }
+
+  .panel, .inset {
+    border: none;
+    box-shadow: none;
+    padding: 0;
+    margin-bottom: 0.8rem;
+  }
+
+  /* One person to a page, and never split across two. */
+  .people { display: block; }
+  .person { break-inside: avoid; page-break-inside: avoid; }
+  .person + .person { break-before: page; page-break-before: always; }
+
+  /* The whole team and the semester timeline are wide, not tall. */
+  .weekgrid, .timeline { break-inside: avoid; page-break-inside: avoid; }
+
+  /* Without this the swatches, day colours and timeline bars print blank,
+     which leaves a page of unlabelled boxes. */
+  .swatch, .dot, .blk, .tl-cell, .ribbon .wk, .bar-fill, .badge, .chip {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  a[href]::after { content: ""; }
+}

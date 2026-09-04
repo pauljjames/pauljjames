@@ -56,12 +56,12 @@ def weeks() -> list[dict]:
 
 # Target contact minutes per week. Not everyone has one.
 STAFF = [
-    ("ahern", "Ahern, Kate", "k.ahern@example.ac.nz", 480),
-    ("brill", "Brill, Sam", "s.brill@example.ac.nz", 480),
-    ("chen", "Chen, Wei", "w.chen@example.ac.nz", 360),
-    ("dalzell", "Dalzell, Ruth", "r.dalzell@example.ac.nz", 240),
-    ("edmond", "Edmond, Tai", "t.edmond@example.ac.nz", None),
-    ("fenwick", "Fenwick, Jo", "j.fenwick@example.ac.nz", 480),
+    ("ahern", "Kate Ahern", "k.ahern@example.ac.nz", 480),
+    ("brill", "Sam Brill", "s.brill@example.ac.nz", 480),
+    ("chen", "Wei Chen", "w.chen@example.ac.nz", 360),
+    ("dalzell", "Ruth Dalzell", "r.dalzell@example.ac.nz", 240),
+    ("edmond", "Tai Edmond", "t.edmond@example.ac.nz", None),
+    ("fenwick", "Jo Fenwick", "j.fenwick@example.ac.nz", 480),
 ]
 
 SCHOOL = "MU00693 - School of Music and Screen Arts"

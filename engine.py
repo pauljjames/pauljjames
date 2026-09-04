@@ -840,6 +840,83 @@ def classes_for(classes: list[Class], staff_id: str, week: int | None = None) ->
     ]
 
 
+# ------------------------------------------------------------ reconciliation
+
+def reconcile(
+    timetable: list[TimetableRow],
+    courses: list[Course],
+    planning: tuple[str, str] | None = None,
+) -> dict[str, list[dict]]:
+    """Where the timetable and the catalogue disagree, in a form you can act on.
+
+    validate() has always said this in prose. Prose cannot be clicked, so the
+    same rule is computed here with the row ids attached and reported both ways:
+    as strings for the problems panel, and as structure for the interface.
+
+    Three findings, and only one of them is a fault:
+
+      unknown       a timetabled course the catalogue has never heard of. Its
+                    classes have no name anywhere in the tool.
+      not_offered   a timetabled course the catalogue knows, but not as an
+                    offering in the term being planned.
+      untimetabled  a course the catalogue offers this term with nothing on the
+                    timetable. Normal: the catalogue is the whole institution
+                    and this manager staffs a corner of it. Reported so the
+                    interface can show it, never so anything can delete it.
+
+    Matching is on the bare code, exactly as expand() names classes. A code
+    differing by a space or a letter is a different course here, which is why
+    unknown is a list to look at rather than a list to act on blindly.
+    """
+    rows_by_code: dict[str, list[TimetableRow]] = {}
+    for row in timetable:
+        rows_by_code.setdefault(row.course_code, []).append(row)
+
+    def found(code: str) -> dict:
+        rows = rows_by_code[code]
+        return {
+            "code": code,
+            "row_ids": sorted(r.id for r in rows),
+            "sections": sorted({r.section for r in rows}),
+        }
+
+    unknown: list[dict] = []
+    not_offered: list[dict] = []
+    untimetabled: list[dict] = []
+
+    # An empty catalogue is not evidence that every code is wrong; it is a tool
+    # nobody has imported courses into yet.
+    if courses:
+        known = {c.code for c in courses}
+        unknown = [found(code) for code in sorted(set(rows_by_code) - known)]
+
+        if planning:
+            year, semester = planning
+            offered = {
+                c.code: c for c in courses
+                if c.academic_year == year and c.semester == semester
+            }
+            not_offered = [
+                found(code)
+                for code in sorted(set(rows_by_code) & known - set(offered))
+            ]
+            untimetabled = [
+                {
+                    "code": course.code,
+                    "name": course.name,
+                    "occurrence": course.occurrence,
+                }
+                for code, course in sorted(offered.items())
+                if code not in rows_by_code
+            ]
+
+    return {
+        "unknown": unknown,
+        "not_offered": not_offered,
+        "untimetabled": untimetabled,
+    }
+
+
 # ------------------------------------------------------------ validation
 
 def validate(
@@ -908,26 +985,24 @@ def validate(
         seen_offerings.add(course.key)
 
     # A timetable naming a course nobody has heard of is worth saying out loud:
-    # the class will have no name anywhere in the tool.
-    if catalogue:
-        known = {c.code for c in catalogue}
-        for code in sorted({r.course_code for r in timetable} - known):
-            issues.append(
-                f"{code}: not in the course list, so it has no name. "
-                "Import the course, or correct the code."
-            )
+    # the class will have no name anywhere in the tool. The rule lives in
+    # reconcile(), so the prose here and the panel the interface draws can never
+    # disagree about what counts as a mismatch.
+    mismatched = reconcile(timetable, catalogue, planning)
 
-        if planning:
-            year, semester = planning
-            running = {
-                c.code for c in catalogue
-                if c.academic_year == year and c.semester == semester
-            }
-            for code in sorted({r.course_code for r in timetable} & known - running):
-                issues.append(
-                    f"{code}: in the course list, but not as an offering in "
-                    f"{semester} {year}, which is what you are planning."
-                )
+    for found in mismatched["unknown"]:
+        issues.append(
+            f"{found['code']}: not in the course list, so it has no name. "
+            "Import the course, or correct the code."
+        )
+
+    if planning:
+        year, semester = planning
+        for found in mismatched["not_offered"]:
+            issues.append(
+                f"{found['code']}: in the course list, but not as an offering in "
+                f"{semester} {year}, which is what you are planning."
+            )
 
     # Assignments
     rows_by_id = {r.id: r for r in timetable}

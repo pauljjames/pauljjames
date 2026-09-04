@@ -133,6 +133,12 @@ what still needs staffing, and what each person is carrying against their
 target. The bar is red when somebody's average is over their target; a week by
 week spike is flagged beside it instead, because those are different problems.
 
+*Needs somebody* is grouped by course and section rather than listed a week at a
+time, emptiest first, and searchable by course, section or day. It shows the
+first twenty five and says how many more there are, because a school that has
+just imported a timetable and staffed none of it has hundreds, and a list that
+long is not a list anybody reads.
+
 **Planner** is where staffing is decided. One row per class, showing who covers
 which weeks as named spans over a ribbon of the semester, so a gap is visible
 without reading anything. Each person keeps the same colour throughout.
@@ -175,8 +181,12 @@ comes first, so the answer does not wander between visits.
 
 *The whole team* is everyone at once in one week, laid out as the week is. Free
 time is the empty space, which is what you are looking at when you have a class
-to give away, and underneath it names what nobody is on and who is free at that
-hour. Pick the week along the top.
+to give away. Pick the week along the top.
+
+Classes nobody is on are not drawn here, and the count of them links to the
+Dashboard instead. This view answers "who is free", and a term nobody has
+staffed yet fills it with dashed blocks and a tile per gap until the empty space
+you came for is buried under the very thing you were going to use it for.
 
 *The semester* is every commitment as a bar across the twelve weeks. A handover
 is one bar stopping where another starts, so a split semester, a cancelled week
@@ -186,6 +196,12 @@ Colour means the day in the first mode, because within one person the day is
 what there is to tell apart; it means the person in the other two, because there
 the people are.
 
+*Export* is a workbook: a summary sheet of hours per person per week, then a
+sheet each laying their usual week out as a calendar, with the weeks that depart
+from it underneath. *Print* puts the view you are looking at on paper, one
+person to a page. Both are built from the same shapes the page draws, so a
+printout and the screen cannot disagree.
+
 **Load** is contact hours per person per week, against their target. Timetabled
 minutes only, so it will not match a workload allocation that also covers
 supervision, marking and admin.
@@ -194,6 +210,20 @@ supervision, marking and admin.
 
 **Setup** holds staff, the teaching calendar, the timetable import, the year
 and semester you are planning, and the sample data controls.
+
+Staff is a table you type into. Change a cell and it saves when you leave it;
+type a name into the blank row at the bottom and that person exists, with a
+fresh blank row underneath. Adding a team is a run of typing rather than six
+trips through a dialog. Saving puts the caret back in the cell it came from, so
+nothing moves under you.
+
+Names are written the way people write them: *Kate Ahern*, not *Ahern, Kate*.
+The list sorts by that name as typed. An id is derived from the name rather than
+asked for, since it is bookkeeping for the records to point at and not something
+anybody should have to invent; it is shown so it can be recognised, and changing
+one is a delete and re-add, because renaming an id carries somebody's whole
+staffing with it and is not a thing to trigger from a half typed cell. If any
+names are still written surname first, the panel offers to turn them round.
 
 *Remove the sample data* takes out only what the app invented and leaves
 anything you have imported or typed, which matters because the sample uses real
@@ -307,13 +337,33 @@ the same week produces duplicate classes and a clash that is not real. It is the
 failure that made the spreadsheet version untrustworthy, so it is reported by
 name rather than silently absorbed.
 
+### The timetable and the catalogue
+
+The last two of those get their own panel at the foot of the Courses page, where
+they can be acted on rather than only read. It lists the codes timetabled here
+that the catalogue does not have for this semester, and hands them to the
+Planner with their rows ticked, where deleting is one click and comes back with
+an undo.
+
+It hands them over rather than deleting them itself on purpose. Course codes are
+matched exactly, so a stray space reads as a course nobody has heard of and
+looks identical to the real one on the page. Where that happens the code is
+shown in quotes and said to have a space in it, and the fix is usually to
+correct the code rather than to delete the class. A delete button wired straight
+to a typo detector is the wrong shape.
+
+Underneath, the courses the catalogue offers this semester with nothing on the
+timetable. That one is a list and nothing more. Usually it is right — somebody
+else teaches them — and the catalogue is the whole institution while this tool
+staffs a corner of it, so nothing here ever removes a course from it.
+
 ## Layout
 
 ```
 engine.py     the rules: expansion, staffing, conflicts, coverage, load,
               the usual week, the calendar, validation
 importer.py   reading a timetable and a course catalogue out of spreadsheets
-sheets.py     writing the template and the export back out
+sheets.py     writing the template, the export and the staff calendars
 store.py      SQLite, and nothing else
 app.py        HTTP, and nothing else
 seed.py       sample data
@@ -342,7 +392,7 @@ from the class it sits beside rather than the same thing counted twice.
 python -m pytest
 ```
 
-202 tests. The engine cases came from two real course outlines: a lecture
+217 tests. The engine cases came from two real course outlines: a lecture
 running in three weeks only, workshops shortened in those weeks so the lecturer
 is not double booked, a public holiday cancellation, a one week substitution,
 split semester teaching, and an added crit session.
@@ -376,10 +426,24 @@ empty, so clearing the sample and restarting brought it straight back, and
 importing a catalogue before entering any timetable invited the sample to land
 on top of it.
 
+The reconciler is tested against the two mismatches it distinguishes, since they
+have different fixes: a code the catalogue has never held, and one it holds for
+another semester. An empty catalogue reports nothing, because no catalogue is a
+tool nobody has imported courses into, not a timetable where every code is
+wrong. One test asserts that the amber panel and the Courses panel agree, which
+is the point of computing it once and presenting it twice.
+
+The staff workbook is tested as a document rather than a file: a sheet per
+person in the order the page lists them, a class landing in the right day column
+and hour row, a two hour class covering four half hour rows without repeating
+itself, and the summary carrying the hours a week the Load page shows.
+
 Two more are guards rather than features. One removes the exceptions and
 asserts that the clash reappears, so the shortened workshop test cannot pass by
 accident if clash detection stops working. The other checks that when a section
-appears twice in a week, only the class that actually collides is flagged.
+appears twice in a week, only the class that actually collides is flagged. A
+third asserts no sample name is written surname first, so a convention that was
+taken out cannot quietly come back.
 
 ## When it will not start
 

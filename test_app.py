@@ -6,7 +6,9 @@ including refusing the writes it is supposed to refuse.
 """
 
 import importlib
+import io
 
+import openpyxl
 import pytest
 from fastapi.testclient import TestClient
 
@@ -107,7 +109,7 @@ def test_renaming_a_person_carries_their_assignments(conn):
     seed.load(conn)
     store.save_staff(
         conn,
-        {"id": "ahern2", "name": "Ahern, Kate", "email": "", "target_minutes": 480},
+        {"id": "ahern2", "name": "Kate Ahern", "email": "", "target_minutes": 480},
         original_id="ahern",
     )
     assignments = store.get_assignments(conn, seed.TERM)
@@ -417,15 +419,15 @@ def test_append_leaves_the_existing_timetable_alone(client):
 
 def test_staff_can_be_added_edited_and_removed(client):
     client.post("/api/staff", json={
-        "id": "gray", "name": "Gray, Pat", "target_minutes": 300,
+        "id": "gray", "name": "Pat Gray", "target_minutes": 300,
     })
     assert any(s["id"] == "gray" for s in client.get("/api/state").json()["staff"])
 
     client.put("/api/staff/gray", json={
-        "id": "gray", "name": "Gray, Patricia", "target_minutes": 240,
+        "id": "gray", "name": "Patricia Gray", "target_minutes": 240,
     })
     person = next(s for s in client.get("/api/state").json()["staff"] if s["id"] == "gray")
-    assert person["name"] == "Gray, Patricia"
+    assert person["name"] == "Patricia Gray"
     assert person["target_minutes"] == 240
 
     client.delete("/api/staff/gray")
@@ -944,7 +946,6 @@ def test_exporting_and_importing_leaves_the_timetable_where_it_was(client):
 
 def test_the_export_carries_who_teaches_without_letting_it_back_in(client):
     """Staffing is readable in the file and ignored on the way back."""
-    import openpyxl, io
     book = openpyxl.load_workbook(io.BytesIO(client.get("/api/timetable/export.xlsx").content))
     sheet = book["Timetable"]
     header = [c.value for c in sheet[1]]
@@ -953,7 +954,7 @@ def test_the_export_carries_who_teaches_without_letting_it_back_in(client):
 
     rows = {r[0].value + " " + r[1].value: r for r in sheet.iter_rows(min_row=2)}
     split = rows["133168 STU-A"]
-    assert split[7].value == "Chen, Wei 1-6; Dalzell, Ruth 7-12"
+    assert split[7].value == "Wei Chen 1-6; Ruth Dalzell 7-12"
     assert not rows["133150 SHOW-D"][7].value             # nobody on it
     assert rows["133150 SHOW-A"][6].value == "Live Music Showcases"
 
@@ -1053,3 +1054,115 @@ def test_a_calendar_stranded_in_the_scratch_table_is_taken_back(tmp_path):
     weeks = store.get_weeks(conn, ("2027", "S2FS"))
     assert [w.note for w in weeks] == ["stranded"]   # not lost in the scratch table
     conn.close()
+
+
+# ------------------------------------------------------------ staff calendars
+
+def test_the_staff_workbook_gives_everyone_a_sheet(client):
+    reply = client.get("/api/staff/calendars.xlsx")
+    assert reply.status_code == 200
+    assert reply.content[:2] == b"PK"
+    assert "staff-S2FS-2027.xlsx" in reply.headers["content-disposition"]
+
+    book = openpyxl.load_workbook(io.BytesIO(reply.content))
+    assert book.sheetnames[0] == "Summary"
+
+    names = [p["name"] for p in client.get("/api/state").json()["staff"]]
+    assert book.sheetnames[1:] == names
+
+
+def test_the_staff_workbook_lays_a_week_out_as_a_calendar(client):
+    book = openpyxl.load_workbook(
+        io.BytesIO(client.get("/api/staff/calendars.xlsx").content))
+    sheet = book["Jo Fenwick"]
+
+    # Days across, half hours down, and the class in the cell where they meet.
+    assert sheet.cell(row=5, column=1).value == "Time"
+    assert sheet.cell(row=5, column=2).value == "Monday"
+    assert sheet.cell(row=6, column=1).value == "10:00"
+
+    block = sheet.cell(row=6, column=2).value
+    assert "133154 WS-B" in block
+    assert "10:00–12:00" in block
+
+    # A two hour class covers four half hour rows and does not repeat itself.
+    assert sheet.cell(row=7, column=2).value is None
+
+
+def test_the_staff_workbook_says_which_weeks_depart(client):
+    book = openpyxl.load_workbook(
+        io.BytesIO(client.get("/api/staff/calendars.xlsx").content))
+    said = [
+        [cell.value for cell in row]
+        for row in book["Jo Fenwick"].iter_rows()
+    ]
+    flat = [str(v) for row in said for v in row if v]
+    assert any("Weeks that depart" in line for line in flat)
+    assert any("cancelled" in line for line in flat)
+
+
+def test_a_summary_sheet_carries_hours_a_week(client):
+    book = openpyxl.load_workbook(
+        io.BytesIO(client.get("/api/staff/calendars.xlsx").content))
+    summary = book["Summary"]
+    assert summary.cell(row=1, column=1).value == "Staff"
+    assert summary.cell(row=1, column=2).value == "Wk 1"
+
+    row = [c.value for c in summary[2]]
+    assert row[0] == "Jo Fenwick"
+    assert row[1] == 2                        # one two hour workshop
+    assert row[-2] == 0                       # cancelled in week 12
+
+
+# ------------------------------------------------------------ staff ids
+
+def test_a_person_can_be_added_without_inventing_an_id(client):
+    made = client.post("/api/staff", json={"name": "Ada Nkemelu"})
+    assert made.status_code == 200
+    assert made.json()["id"] == "ada-nkemelu"
+
+    names = {p["id"]: p["name"] for p in client.get("/api/state").json()["staff"]}
+    assert names["ada-nkemelu"] == "Ada Nkemelu"
+
+
+def test_two_people_with_the_same_name_get_different_ids(client):
+    first = client.post("/api/staff", json={"name": "Ada Nkemelu"})
+    second = client.post("/api/staff", json={"name": "Ada Nkemelu"})
+    assert first.json()["id"] == "ada-nkemelu"
+    assert second.json()["id"] == "ada-nkemelu-2"
+
+
+def test_a_given_id_is_still_honoured(client):
+    made = client.post("/api/staff", json={"id": "ada", "name": "Ada Nkemelu"})
+    assert made.json()["id"] == "ada"
+
+
+def test_no_sample_staff_name_is_written_surname_first(client):
+    # The tool used to ask for "Surname, First". Nothing should teach it back.
+    for person in client.get("/api/state").json()["staff"]:
+        assert "," not in person["name"]
+
+
+# ------------------------------------------------------------ reconciliation
+
+def test_state_says_which_timetabled_courses_are_not_in_the_catalogue(client):
+    client.post("/api/timetable", json={
+        "course_code": "999999", "section": "A", "day": "Monday",
+        "start": "09:00", "end": "10:00", "weeks": [1],
+    })
+    found = client.get("/api/state").json()["reconciliation"]
+    unknown = {f["code"]: f for f in found["unknown"]}
+    assert "999999" in unknown
+    # The row ids are what makes it actionable rather than merely reported.
+    assert len(unknown["999999"]["row_ids"]) == 1
+
+
+def test_an_update_without_an_id_is_not_a_rename_to_nothing(client):
+    client.post("/api/staff", json={"id": "ada", "name": "Ada Nkemelu"})
+    # The id is optional so the grid can add somebody without inventing one.
+    # On an update that has to mean "leave it alone", not "blank it".
+    client.put("/api/staff/ada", json={"name": "Ada Nkemelu-Brown"})
+
+    people = {p["id"]: p["name"] for p in client.get("/api/state").json()["staff"]}
+    assert people["ada"] == "Ada Nkemelu-Brown"
+    assert "" not in people

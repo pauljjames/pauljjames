@@ -16,6 +16,7 @@ double booking rule real rather than advisory.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date
@@ -39,7 +40,7 @@ HERE = Path(__file__).parent
 # every load, but the routes live in this process, so an unrestarted server
 # serves a new front end against old endpoints. The front end compares this
 # against its own copy and says so rather than failing with a bare 404.
-VERSION = "2026-09-05.3"
+VERSION = "2026-09-05.4"
 
 
 def active_term(conn) -> tuple[str, str]:
@@ -76,7 +77,9 @@ app = FastAPI(title="Timetable staffing", lifespan=lifespan)
 # ------------------------------------------------------------ request bodies
 
 class StaffIn(BaseModel):
-    id: str
+    # Blank is allowed on the way in: the Setup grid asks for a name and lets
+    # the id follow from it, because an id is bookkeeping and a name is not.
+    id: str = ""
     name: str
     email: str = ""
     target_minutes: int | None = None
@@ -271,6 +274,22 @@ def shape_json(s: engine.Shape) -> dict:
     }
 
 
+def staff_id_from(name: str, taken: set[str]) -> str:
+    """An id nobody has to invent, derived from the name.
+
+    Ids exist so assignments and exceptions can point at a person through a
+    rename. Asking a manager to make one up is asking them to do the database's
+    filing, so the grid takes a name and this makes the key.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "somebody"
+    if slug not in taken:
+        return slug
+    n = 2
+    while f"{slug}-{n}" in taken:
+        n += 1
+    return f"{slug}-{n}"
+
+
 def planning_from(settings: dict) -> tuple[str, str] | None:
     year, semester = settings.get("academic_year", ""), settings.get("semester", "")
     return (year, semester) if year and semester else None
@@ -357,6 +376,9 @@ def state() -> dict:
         "issues": engine.validate(
             weeks, staff, timetable, exceptions, assignments,
             courses, planning_from(settings),
+        ),
+        "reconciliation": engine.reconcile(
+            timetable, courses, planning_from(settings),
         ),
     }
 
@@ -622,6 +644,75 @@ def timetable_export() -> Response:
     return spreadsheet(data, f"timetable-{slug}.xlsx" if slug else "timetable.xlsx")
 
 
+def departure_lines(departure: engine.Departure) -> list[str]:
+    """A week's difference in words, for a document rather than a screen.
+
+    The same four differences the Staff page describes, spelled out here
+    because a spreadsheet has no tooltips to fall back on.
+    """
+    lines = []
+    for c in departure.added:
+        lines.append(f"also {c.label}")
+    for c in departure.gone:
+        lines.append(f"no {c.label}")
+    for usually, instead in departure.moved:
+        when = f"{instead.day} {store.from_time(instead.start)}" if instead.day else "moved"
+        lines.append(f"{usually.label} at {when}")
+    for c in departure.cancelled:
+        lines.append(f"{c.label} cancelled")
+    return lines or ["different"]
+
+
+@app.get("/api/staff/calendars.xlsx")
+def staff_calendars() -> Response:
+    """Everyone's teaching as a workbook: hours per week, then a calendar each.
+
+    The person sheets are built from the same shapes the Staff page draws, so
+    the document and the screen cannot drift apart.
+    """
+    with db() as conn:
+        term = active_term(conn)
+        weeks, staff, timetable, exceptions, assignments, courses = store.load_all(conn, term)
+
+    classes = engine.expand(timetable, exceptions, assignments, courses)
+    numbers = [w.number for w in weeks]
+    load = engine.load_by_staff(classes)
+    shapes = {s.staff_id: s for s in engine.shapes(classes, staff, numbers)}
+
+    def as_class(c: engine.Class) -> dict:
+        return {
+            "code": c.course_code,
+            "section": c.section,
+            "name": c.course_title,
+            "day": c.day or "",
+            "start": store.from_time(c.start) or "",
+            "end": store.from_time(c.end) or "",
+            "runs": c.runs,
+        }
+
+    people = []
+    for person in staff:
+        shape = shapes.get(person.id)
+        people.append({
+            "name": person.name,
+            "email": person.email,
+            "target_minutes": person.target_minutes,
+            "usual_weeks": list(shape.usual_weeks) if shape else [],
+            "usual": [as_class(c) for c in shape.usual] if shape else [],
+            "departures": [
+                {"weeks": list(d.weeks), "lines": departure_lines(d)}
+                for d in (shape.departures if shape else ())
+            ],
+            "load": load.get(person.id, {}),
+        })
+
+    slug = term_slug(term)
+    return spreadsheet(
+        sheets.staff_calendars(people, numbers),
+        f"staff-{slug}.xlsx" if slug else "staff.xlsx",
+    )
+
+
 @app.post("/api/courses/import/preview")
 async def course_preview(file: UploadFile = File(...)) -> dict:
     """Read a course export and say what it would change. Nothing is written."""
@@ -738,19 +829,27 @@ def generate_weeks(body: WeeksGenerateIn) -> dict:
 
 @app.post("/api/staff")
 def post_staff(body: StaffIn) -> dict:
+    person = body.model_dump()
     try:
         with db() as conn:
-            store.save_staff(conn, body.model_dump())
+            if not person["id"]:
+                taken = {p.id for p in store.get_staff(conn)}
+                person["id"] = staff_id_from(person["name"], taken)
+            store.save_staff(conn, person)
     except sqlite3.IntegrityError:
-        raise HTTPException(409, f"Staff id {body.id} is already in use.")
-    return {"ok": True}
+        raise HTTPException(409, f"Staff id {person['id']} is already in use.")
+    return {"ok": True, "id": person["id"]}
 
 
 @app.put("/api/staff/{staff_id}")
 def put_staff(staff_id: str, body: StaffIn) -> dict:
+    person = body.model_dump()
+    # An id is optional on the way in so the grid can add somebody without one.
+    # On an update that must not read as "rename this person to nothing".
+    person["id"] = person["id"] or staff_id
     with db() as conn:
-        store.save_staff(conn, body.model_dump(), original_id=staff_id)
-    return {"ok": True}
+        store.save_staff(conn, person, original_id=staff_id)
+    return {"ok": True, "id": person["id"]}
 
 
 @app.delete("/api/staff/{staff_id}")
